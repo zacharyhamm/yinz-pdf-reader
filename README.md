@@ -52,11 +52,15 @@ percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
 `t` lists the document's outline, indented by level, with each entry's printed
 page on the right, starting on the section you are in. `j`/`k`, the arrows,
 `d`/`u`, `PgUp`/`PgDn`, `g`/`G` and the wheel move; `Enter` jumps there and
-`Esc`, `q` or `t` closes the list.
+`Esc`, `q` or `t` closes the list. Entries that point at no page are shown
+dimmed and skipped.
 
 When a PDF labels its pages (front matter in roman numerals, say, so that
 printed page 2 is the 22nd page), the status line shows both, `p. 2  22/256`,
-and typing a number goes to that printed page.
+and typing a number goes to that printed page. If the numbering restarts (an
+appendix starting again at 1), it goes to the next page with that label after
+the current one, so typing the number again steps through them; a number no
+page carries is reported rather than taken as a PDF page.
 
 ## Reopening where you left off
 

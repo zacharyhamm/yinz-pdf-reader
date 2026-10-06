@@ -2,14 +2,16 @@ import {assert, assertEquals, session, test, type TestOptions} from 'yinz:testin
 
 /**
  * A minimal, valid, pure-ASCII PDF: `pages` letter pages, each labelled "Page n".
- * With `extras`, the first two pages are labelled i and ii and the rest 1, 2, …,
- * and the outline has "Front matter" on page 1 and "Chapter n" on page 10n
- * (page 30 is printed page 28), with "Section 2.1" under "Chapter 2" on page 25.
+ * With `extras`, pages 1–2 are labelled i and ii, pages 3–40 1 to 38 and pages
+ * 41–50, an appendix whose numbering restarts, 1 to 10. The outline has "Front
+ * matter" on page 1, "Chapter n" on page 10n (page 30 is printed page 28) and
+ * then, out of page order, "Index" on page 5. "Section 2.1" under "Chapter 2"
+ * is on page 25, and "Missing" under "Chapter 3" points at no page.
  */
 function samplePdf(pages: number, extras = false): string {
   const outlineFirst = 4 + pages * 2;
   const extrasDict = extras
-    ? ` /PageLabels << /Nums [0 << /S /r >> 2 << /S /D >>] >> /Outlines ${outlineFirst} 0 R`
+    ? ` /PageLabels << /Nums [0 << /S /r >> 2 << /S /D >> 40 << /S /D >>] >> /Outlines ${outlineFirst} 0 R`
     : '';
   const objects: string[] = [
     `<< /Type /Catalog /Pages 2 0 R${extrasDict} >>`,
@@ -24,20 +26,25 @@ function samplePdf(pages: number, extras = false): string {
     );
   }
   if (extras) {
-    // Outline root, then Front matter, Chapter 1..3, and Section 2.1.
+    // Outline root, the top-level entries, then Section 2.1 and Missing.
     const root = outlineFirst;
     const ref = (n: number): string => `${4 + (n - 1) * 2} 0 R`;
-    const top = [root + 1, root + 2, root + 3, root + 4];
-    const titles = ['Front matter', 'Chapter 1', 'Chapter 2', 'Chapter 3'];
-    const targets = [1, 10, 20, 30];
-    objects.push(`<< /Type /Outlines /First ${top[0]} 0 R /Last ${top[3]} 0 R /Count 5 >>`);
+    const titles = ['Front matter', 'Chapter 1', 'Chapter 2', 'Chapter 3', 'Index'];
+    const targets = [1, 10, 20, 30, 5];
+    const top = titles.map((_, i) => root + 1 + i);
+    const child: Record<number, number> = {2: root + 6, 3: root + 7};
+    objects.push(`<< /Type /Outlines /First ${top[0]} 0 R /Last ${top.at(-1)} 0 R /Count 7 >>`);
     top.forEach((id, i) => {
       const prev = i > 0 ? ` /Prev ${id - 1} 0 R` : '';
       const next = i < top.length - 1 ? ` /Next ${id + 1} 0 R` : '';
-      const kids = i === 2 ? ` /First ${root + 5} 0 R /Last ${root + 5} 0 R /Count 1` : '';
+      const kid = child[i];
+      const kids = kid === undefined ? '' : ` /First ${kid} 0 R /Last ${kid} 0 R /Count 1`;
       objects.push(`<< /Title (${titles[i]}) /Parent ${root} 0 R${prev}${next}${kids} /Dest [${ref(targets[i] ?? 1)} /Fit] >>`);
     });
-    objects.push(`<< /Title (Section 2.1) /Parent ${top[2]} 0 R /Dest [${ref(25)} /Fit] >>`);
+    objects.push(
+      `<< /Title (Section 2.1) /Parent ${top[2]} 0 R /Dest [${ref(25)} /Fit] >>`,
+      `<< /Title (Missing) /Parent ${top[3]} 0 R /Dest (nowhere) >>`,
+    );
   }
   let out = '%PDF-1.4\n';
   const offsets: number[] = [];
@@ -193,14 +200,14 @@ test('the table of contents jumps to a section', GRANTS, async () => {
   await session.waitForText('p. 20  22/50');
   // Opens on the section containing page 22, Chapter 2.
   session.key('t');
-  await session.waitForText('contents  3/5');
+  await session.waitForText('contents  3/7');
   await session.waitForText('Section 2.1');
   session.key('j');
-  await session.waitForText('contents  4/5');
+  await session.waitForText('contents  4/7');
   session.key('Enter');
   await session.waitForText('p. 23  25/50');
   session.key('t');
-  await session.waitForText('contents  4/5');
+  await session.waitForText('contents  4/7');
   session.key('Esc');
   await session.waitForText('p. 23  25/50');
 });
@@ -245,4 +252,48 @@ test('reopens a document where it was left', GRANTS, async () => {
   assertEquals(column('fit'), {Text: 'width'});
   session.reload('./main.ts');
   await session.waitForText('17/50  fit width');
+});
+
+test('the table of contents copes with an outline out of page order', GRANTS, async () => {
+  const file = sample(true);
+  session.start({rows: 40, columns: 120});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file}});
+  await session.waitForText('1/50');
+  session.key('G');
+  await session.waitForText('50/50');
+  // Chapter 3, not Index (page 5), which comes after it in the outline.
+  session.key('t');
+  await session.waitForText('contents  5/7');
+  // Missing, which has no page, is listed but skipped.
+  await session.waitForText('Missing');
+  session.key('j');
+  await session.waitForText('contents  7/7');
+  session.key('k');
+  await session.waitForText('contents  5/7');
+  session.key('Enter');
+  await session.waitForText('p. 28  30/50');
+});
+
+test('steps through restarted page numbers and refuses unknown ones', GRANTS, async () => {
+  const file = sample(true);
+  session.start({rows: 40, columns: 120});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file}});
+  await session.waitForText('p. i  1/50');
+  session.text('5');
+  session.key('Enter');
+  await session.waitForText('p. 5  7/50');
+  // The appendix restarts at 1, so printed page 5 appears again on page 45.
+  session.text('5');
+  session.key('Enter');
+  await session.waitForText('p. 5  45/50');
+  session.text('5');
+  session.key('Enter');
+  await session.waitForText('p. 5  7/50');
+  // No page is labelled 49, so stay put rather than go to page 49.
+  session.text('49');
+  session.key('Enter');
+  await session.waitForText('no page labelled 49');
+  await session.waitForText('p. 5  7/50');
 });

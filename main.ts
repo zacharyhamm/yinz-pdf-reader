@@ -62,7 +62,7 @@ interface Search {
 interface Entry {
   readonly title: string;
   readonly depth: number;
-  /** 1-based; outline entries that resolve to no page are dropped. */
+  /** 1-based, or 0 for an entry that resolves to no page; those are listed but cannot be chosen. */
   readonly page: number;
 }
 
@@ -116,6 +116,8 @@ let outline: readonly Entry[] = [];
 // Printed labels by page (index 0 is page 1), or null when they are just the page numbers.
 let labels: readonly string[] | null = null;
 let metaReady = false;
+// Why there is no outline when the document might have one, or ''.
+let metaProblem = '';
 let contents = false;
 let tocIndex = 0;
 let tocTop = 0;
@@ -214,6 +216,7 @@ async function openDoc(path: string, keepPage = false): Promise<void> {
   outline = [];
   labels = null;
   metaReady = false;
+  metaProblem = '';
   contents = false;
   if (keepPage) {
     page = Math.min(page, pages);
@@ -278,9 +281,13 @@ function walk(items, depth) {
     if (item.down) walk(item.down, depth + 1);
   }
 }
-var o = d.loadOutline();
-if (o) walk(o, 0);
-for (var i = 0, n = d.countPages(); i < n; i++) out.labels.push(d.loadPage(i).getLabel() || '');
+try { var o = d.loadOutline(); if (o) walk(o, 0); } catch (e) {}
+// A page that fails to load, or a mutool without labels, only loses its label.
+for (var i = 0, n = d.countPages(); i < n; i++) {
+  var label = '';
+  try { label = d.loadPage(i).getLabel() || ''; } catch (e) {}
+  out.labels.push(label);
+}
 print(JSON.stringify(out));
 `;
 
@@ -290,6 +297,7 @@ async function loadMeta(current: Doc): Promise<void> {
   metaReady = true;
   if (!result?.ok) {
     if (result) z.log(`could not read the outline: ${result.stderr}`);
+    metaProblem = result ? 'could not read the table of contents' : 'the table of contents needs mutool';
     z.requestRender();
     return;
   }
@@ -298,8 +306,10 @@ async function loadMeta(current: Doc): Promise<void> {
   const found = field(meta, 'labels');
   outline = (Array.isArray(entries) ? entries : []).map((entry: unknown) => {
     const title = field(entry, 'title');
-    return {title: typeof title === 'string' ? title : '', depth: Number(field(entry, 'depth')), page: Number(field(entry, 'page'))};
-  }).filter(entry => entry.page >= 1 && entry.page <= current.pages);
+    const target = Number(field(entry, 'page'));
+    // Unresolved entries stay, unselectable, so their children keep their parent.
+    return {title: typeof title === 'string' ? title : '', depth: Number(field(entry, 'depth')) || 0, page: target >= 1 && target <= current.pages ? target : 0};
+  });
   const printed = (Array.isArray(found) ? found : []).map((label: unknown) => (typeof label === 'string' ? label : ''));
   labels = printed.every((label, i) => label === '' || label === String(i + 1)) ? null : printed;
   z.requestRender();
@@ -309,10 +319,27 @@ function field(value: unknown, key: string): unknown {
   return typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
 }
 
-/** The page whose printed label is `label`, if the PDF has labels. */
-function labelledPage(label: string): number | null {
-  const i = labels?.indexOf(label) ?? -1;
-  return i === -1 ? null : i + 1;
+/**
+ * The next page after the current one labelled `label`, wrapping, so that
+ * repeating a number steps through parts whose numbering restarts.
+ */
+function labelledPage(printed: readonly string[], label: string): number | null {
+  for (let k = 1; k <= printed.length; k += 1) {
+    const i = (page - 1 + k) % printed.length;
+    if (printed[i] === label) return i + 1;
+  }
+  return null;
+}
+
+/** Go to a typed page: a printed page label when the PDF has labels, else a page number. */
+function goToTyped(typed: string): void {
+  if (!labels) {
+    goTo(Number(typed));
+    return;
+  }
+  const target = labelledPage(labels, typed);
+  if (target === null) notice = `no page labelled ${typed}`;
+  else goTo(target);
 }
 
 function pageLabel(n: number): string {
@@ -690,22 +717,38 @@ const ALIASES: Record<string, string> = {
 };
 
 function openContents(): boolean {
-  if (outline.length === 0) {
-    notice = metaReady ? 'no table of contents' : 'reading the table of contents…';
+  if (!outline.some(entry => entry.page > 0)) {
+    if (metaReady) notice = metaProblem === '' ? 'no table of contents' : metaProblem;
+    else notice = 'reading the table of contents…';
     return true;
   }
   contents = true;
-  // Start on the section the current page is in.
-  const after = outline.findIndex(entry => entry.page > page);
-  tocIndex = Math.max(0, (after === -1 ? outline.length : after) - 1);
+  // Start on the section the current page is in: the entry with the latest
+  // page at or before it, the last of those on a tie. Outlines need not be in
+  // page order, so look at every entry.
+  let best = -1;
+  for (const [i, entry] of outline.entries()) {
+    if (entry.page > 0 && entry.page <= page && (best === -1 || entry.page >= (outline[best]?.page ?? 0))) best = i;
+  }
+  tocIndex = best === -1 ? outline.findIndex(entry => entry.page > 0) : best;
   return true;
 }
 
+/** Move the selection by `delta` entries, skipping entries without a page. */
 function moveContents(delta: number): boolean {
-  const next = Math.min(outline.length - 1, Math.max(0, tocIndex + delta));
-  if (next === tocIndex) return false;
-  tocIndex = next;
-  return true;
+  const target = Math.min(outline.length - 1, Math.max(0, tocIndex + delta));
+  const direction = delta > 0 ? 1 : -1;
+  // Settle on the nearest selectable entry, first in the direction of travel.
+  for (const dir of [direction, -direction]) {
+    for (let i = target; i >= 0 && i < outline.length; i += dir) {
+      if ((outline[i]?.page ?? 0) > 0) {
+        if (i === tocIndex) return false;
+        tocIndex = i;
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function handleContentsKey(name: string): boolean {
@@ -719,7 +762,7 @@ function handleContentsKey(name: string): boolean {
   if (name === 'Enter') {
     const entry = outline[tocIndex];
     contents = false;
-    if (entry) goTo(entry.page);
+    if (entry && entry.page > 0) goTo(entry.page);
     return true;
   }
   if (name === 'Esc' || name === 'q' || name === 't') {
@@ -740,11 +783,12 @@ function drawContents(rows: number, cols: number): string {
       lines.push('');
       continue;
     }
-    const right = ` ${pageLabel(entry.page)} `;
+    const right = entry.page > 0 ? ` ${pageLabel(entry.page)} ` : ' ';
     const left = ` ${'  '.repeat(entry.depth)}${z.text.sanitize(entry.title)}`;
     const width = Math.max(0, cols - z.text.width(right));
     const line = z.text.pad(z.text.truncate(left, width), width) + right;
-    lines.push(i === tocIndex ? `\u001B[7m${line}\u001B[27m` : line);
+    if (i === tocIndex) lines.push(`\u001B[7m${line}\u001B[27m`);
+    else lines.push(entry.page > 0 ? line : `\u001B[2m${line}\u001B[22m`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -786,7 +830,7 @@ function handleCommandKey(name: string, ctrl: boolean): boolean {
     return true;
   }
   if (digits !== '' && (name === 'Enter' || name === 'Esc')) {
-    if (name === 'Enter') goTo(labelledPage(digits) ?? Number(digits));
+    if (name === 'Enter') goToTyped(digits);
     digits = '';
     return true;
   }
