@@ -125,6 +125,8 @@ let tocTop = 0;
 let saved = '';
 let renderer: 'mutool' | 'pdftoppm' = 'mutool';
 let homeDir = '';
+// Holds the mutool run scripts, written once at load and removed on unload.
+let scratch = '';
 let lastRows = 0;
 let lastCols = 0;
 let requested = '';
@@ -269,9 +271,9 @@ function remember(): void {
 }
 
 // Prints the outline, flattened with depths and resolved to 1-based pages, and
-// each page's label as JSON. Arguments: unused output file, document.
+// each page's label as JSON. Argument: document.
 const META_SCRIPT = `
-var d = Document.openDocument(scriptArgs[1]);
+var d = Document.openDocument(scriptArgs[0]);
 var out = {outline: [], labels: []};
 function walk(items, depth) {
   for (var i = 0; i < items.length; i++) {
@@ -292,7 +294,7 @@ print(JSON.stringify(out));
 `;
 
 async function loadMeta(current: Doc): Promise<void> {
-  const result = renderer === 'mutool' ? await run(mutoolRun(META_SCRIPT, [current.path], false)) : null;
+  const result = renderer === 'mutool' ? await run(mutoolRun('meta.js', [current.path], false)) : null;
   if (doc !== current) return;
   metaReady = true;
   if (!result?.ok) {
@@ -348,15 +350,14 @@ function pageLabel(n: number): string {
 }
 
 /**
- * Wrap a mutool run script so it can be passed inline: mutool run needs a
- * script file and cannot write a PNG to stdout, and plugins cannot remove files
- * when they unload, so each run gets its own directory. The script's first
- * argument is a PNG path, printed afterwards when `png` is set.
+ * Run one of the scripts in the scratch directory. mutool run cannot write a
+ * PNG to stdout, so when `png` is set the script's first argument is a fresh
+ * file there, printed and removed afterwards.
  */
 function mutoolRun(script: string, args: readonly string[], png: boolean): string[] {
-  const cat = png ? ' && cat "$d/p.png"' : '';
-  const sh = `d=$(mktemp -d) || exit 1; trap 'rm -rf "$d"' EXIT; printf %s "$0" > "$d/s.js" && mutool run "$d/s.js" "$d/p.png" "$@"${cat}`;
-  return ['sh', '-c', sh, script, ...args];
+  if (!png) return ['mutool', 'run', `${scratch}/${script}`, ...args];
+  const sh = `s=$0/$1; shift; p=$(mktemp "$0/XXXXXX") || exit 1; trap 'rm -f "$p"' EXIT; mutool run "$s" "$p" "$@" && cat "$p"`;
+  return ['sh', '-c', sh, scratch, script, ...args];
 }
 
 function clearSearch(): void {
@@ -547,7 +548,7 @@ function rasterKey(n: number, box: Box, hl: Highlight | null = highlight(n)): st
 function rasterCommand(path: string, n: number, box: Box, hl: Highlight | null): string[] {
   const pxW = String(box.w * cellWidthPx * density);
   const pxH = String(box.h * cellHeightPx * density);
-  if (hl) return mutoolRun(HIGHLIGHT_SCRIPT, [path, String(n), pxW, pxH, invert ? '1' : '0', hl.marks], true);
+  if (hl) return mutoolRun('highlight.js', [path, String(n), pxW, pxH, invert ? '1' : '0', hl.marks], true);
   if (renderer === 'mutool') {
     const flags = invert ? ['-I'] : [];
     return ['mutool', 'draw', '-q', '-F', 'png', '-o', '-', '-w', pxW, '-h', pxH, ...flags, path, String(n)];
@@ -953,7 +954,18 @@ async function detectTools(): Promise<void> {
   const probe = await run(['sh', '-c', 'echo "$HOME"; command -v mutool || true']);
   const [home = '', mutool = ''] = z.decodeUtf8(probe.stdout).split('\n');
   homeDir = home;
-  if (mutool === '') renderer = 'pdftoppm';
+  if (mutool === '') {
+    renderer = 'pdftoppm';
+    return;
+  }
+  const sh = 'd=$(mktemp -d -t yinz-pdf-reader.XXXXXX) && printf %s "$0" > "$d/meta.js" && printf %s "$1" > "$d/highlight.js" && echo "$d"';
+  const made = await run(['sh', '-c', sh, META_SCRIPT, HIGHLIGHT_SCRIPT]);
+  scratch = z.decodeUtf8(made.stdout).trim();
+  if (!made.ok || scratch === '') {
+    z.log(`could not write the mutool scripts: ${made.stderr}`);
+    scratch = '';
+    renderer = 'pdftoppm';
+  }
 }
 
 const DEFAULTS = {file: '', cell_width: '12', cell_height: '22', density: '2', fit: 'page', invert: 'false'};
@@ -998,6 +1010,9 @@ export default definePlugin({
     await detectTools();
     const file = configuredFile(config);
     if (file !== '') await openDoc(file);
+  },
+  async unload() {
+    if (scratch !== '') await run(['rm', '-rf', scratch]);
   },
   update(event) {
     if (typeof event !== 'object') return false;
