@@ -8,7 +8,10 @@ scrolls, moves and resizes with the pane.
 Requires a kitty-graphics terminal (kitty, Ghostty, WezTerm, …) and `pdfinfo`
 plus `mutool` (MuPDF) or `pdftoppm` (Poppler) on the host. Search uses
 `pdftotext` (Poppler, alongside `pdfinfo`); highlighting matches on the page
-needs `mutool`.
+needs `mutool`, as do the table of contents and printed page labels.
+
+The plugin asks for `RunCommands`, to run those tools, and `PluginData`, to
+remember where each document was left.
 
 ## Opening a document
 
@@ -33,7 +36,8 @@ percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
 | `n` `Space` `PgDn` `l` `→` | next page |
 | `p` `Backspace` `PgUp` `h` `←` | previous page |
 | `g` `Home` / `G` `End` | first / last page |
-| *number* `Enter` | go to page |
+| *number* `Enter` | go to page: the printed page label if the PDF has labels, else the PDF page |
+| `t` | table of contents |
 | `f` / `w` | toggle fit page / fit width |
 | `i` | invert colours (mutool only) |
 | `r` | reload the document |
@@ -42,6 +46,22 @@ percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
 | `n` / `N` | next / previous match while searching |
 | `Esc` | clear the search, or close when none is active |
 | `q` | close |
+
+## Table of contents and page labels
+
+`t` lists the document's outline, indented by level, with each entry's printed
+page on the right, starting on the section you are in. `j`/`k`, the arrows,
+`d`/`u`, `PgUp`/`PgDn`, `g`/`G` and the wheel move; `Enter` jumps there and
+`Esc`, `q` or `t` closes the list.
+
+When a PDF labels its pages (front matter in roman numerals, say, so that
+printed page 2 is the 22nd page), the status line shows both, `p. 2  22/256`,
+and typing a number goes to that printed page.
+
+## Reopening where you left off
+
+The page, scroll position, fit mode and inversion are saved for each file and
+restored when it is opened again. `r` reloads in place.
 
 ## Searching
 
@@ -73,4 +93,5 @@ yinz plugins test --file main.ts
 ```
 
 The integration tests build a 50-page PDF in a disposable yinz session and page,
-scroll, jump and search through it.
+scroll, jump and search through it; a variant with an outline and page labels
+covers the table of contents, and a reload checks the saved position.

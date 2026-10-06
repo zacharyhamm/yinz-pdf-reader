@@ -16,7 +16,9 @@
 // Space/PgDn/n/l next page, Backspace/PgUp/p/h previous page, g/G first/last,
 // <number>Enter go to page, f toggle fit page / fit width, i invert colours,
 // r reload, o open, q/Esc close. The mouse wheel scrolls. / searches; while a
-// search is active n/N go to the next/previous match and Esc clears it.
+// search is active n/N go to the next/previous match and Esc clears it. t opens
+// the table of contents. <number>Enter goes to a printed page label when the
+// PDF has one, and each file reopens where it was left.
 import z, {definePlugin} from 'yinz:plugin';
 
 type Fit = 'page' | 'width';
@@ -57,6 +59,20 @@ interface Search {
   index: number;
 }
 
+interface Entry {
+  readonly title: string;
+  readonly depth: number;
+  /** 1-based; outline entries that resolve to no page are dropped. */
+  readonly page: number;
+}
+
+interface Position {
+  readonly page: number;
+  readonly scroll: number;
+  readonly fit: Fit;
+  readonly invert: boolean;
+}
+
 const LETTER: readonly [number, number] = [612, 792];
 const CACHE_LIMIT = 12;
 
@@ -95,6 +111,16 @@ const boxes = new Map<number, Rect[][]>();
 const boxesPending = new Set<number>();
 // Scroll the current match into view once its page's boxes arrive.
 let revealPending = false;
+// The outline and printed page labels, read with mutool after a document opens.
+let outline: readonly Entry[] = [];
+// Printed labels by page (index 0 is page 1), or null when they are just the page numbers.
+let labels: readonly string[] | null = null;
+let metaReady = false;
+let contents = false;
+let tocIndex = 0;
+let tocTop = 0;
+// The position last written to the data store, to skip unchanged writes.
+let saved = '';
 let renderer: 'mutool' | 'pdftoppm' = 'mutool';
 let homeDir = '';
 let lastRows = 0;
@@ -185,11 +211,125 @@ async function openDoc(path: string, keepPage = false): Promise<void> {
   clearSearch();
   texts = null;
   doc = {path: full, title: title === '' ? basename(full) : title, pages, sizes};
-  page = keepPage ? Math.min(page, pages) : 1;
-  if (!keepPage) scroll = 0;
+  outline = [];
+  labels = null;
+  metaReady = false;
+  contents = false;
+  if (keepPage) {
+    page = Math.min(page, pages);
+  } else {
+    const last = recall(full);
+    page = Math.min(pages, Math.max(1, last?.page ?? 1));
+    scroll = last?.scroll ?? 0;
+    if (last) {
+      fit = last.fit;
+      invert = last.invert;
+    }
+  }
+  saved = '';
   status = '';
   background(indexText(doc));
+  background(loadMeta(doc));
   z.requestRender();
+}
+
+const POSITIONS = 'position';
+
+/** Where `path` was left, from the plugin's private data store. */
+function recall(path: string): Position | null {
+  try {
+    const row = z.data.fetch({entity: POSITIONS, filter: z.data.eq('path', path), limit: 1}).records[0];
+    if (!row) return null;
+    return {
+      page: Number(row['page'] ?? 1),
+      scroll: Number(row['scroll'] ?? 0),
+      fit: row['fit'] === 'width' ? 'width' : 'page',
+      invert: row['invert'] === true,
+    };
+  } catch (error_: unknown) {
+    z.log(`could not read the saved position: ${String(error_)}`);
+    return null;
+  }
+}
+
+/** Save the current position when it has changed. */
+function remember(): void {
+  if (!doc) return;
+  const now = `${page}:${scroll}:${fit}:${invert}`;
+  if (now === saved) return;
+  saved = now;
+  try {
+    z.data.apply([z.data.put(POSITIONS, {path: doc.path, page, scroll, fit, invert}, {uid: doc.path})]);
+  } catch (error_: unknown) {
+    z.log(`could not save the position: ${String(error_)}`);
+  }
+}
+
+// Prints the outline, flattened with depths and resolved to 1-based pages, and
+// each page's label as JSON. Arguments: unused output file, document.
+const META_SCRIPT = `
+var d = Document.openDocument(scriptArgs[1]);
+var out = {outline: [], labels: []};
+function walk(items, depth) {
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i], target = -1;
+    try { if (item.uri) target = d.resolveLink(item.uri); } catch (e) {}
+    out.outline.push({title: item.title || '', depth: depth, page: target + 1});
+    if (item.down) walk(item.down, depth + 1);
+  }
+}
+var o = d.loadOutline();
+if (o) walk(o, 0);
+for (var i = 0, n = d.countPages(); i < n; i++) out.labels.push(d.loadPage(i).getLabel() || '');
+print(JSON.stringify(out));
+`;
+
+async function loadMeta(current: Doc): Promise<void> {
+  const result = renderer === 'mutool' ? await run(mutoolRun(META_SCRIPT, [current.path], false)) : null;
+  if (doc !== current) return;
+  metaReady = true;
+  if (!result?.ok) {
+    if (result) z.log(`could not read the outline: ${result.stderr}`);
+    z.requestRender();
+    return;
+  }
+  const meta: unknown = JSON.parse(z.decodeUtf8(result.stdout));
+  const entries = field(meta, 'outline');
+  const found = field(meta, 'labels');
+  outline = (Array.isArray(entries) ? entries : []).map((entry: unknown) => {
+    const title = field(entry, 'title');
+    return {title: typeof title === 'string' ? title : '', depth: Number(field(entry, 'depth')), page: Number(field(entry, 'page'))};
+  }).filter(entry => entry.page >= 1 && entry.page <= current.pages);
+  const printed = (Array.isArray(found) ? found : []).map((label: unknown) => (typeof label === 'string' ? label : ''));
+  labels = printed.every((label, i) => label === '' || label === String(i + 1)) ? null : printed;
+  z.requestRender();
+}
+
+function field(value: unknown, key: string): unknown {
+  return typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
+}
+
+/** The page whose printed label is `label`, if the PDF has labels. */
+function labelledPage(label: string): number | null {
+  const i = labels?.indexOf(label) ?? -1;
+  return i === -1 ? null : i + 1;
+}
+
+function pageLabel(n: number): string {
+  const label = labels?.[n - 1] ?? '';
+  return label === '' ? String(n) : label;
+}
+
+/**
+ * Wrap a mutool run script so it can be passed inline: mutool run needs a
+ * script file and cannot write a PNG to stdout, and plugins cannot remove files
+ * when they unload, so each run gets its own directory. The script's first
+ * argument is a PNG path, printed afterwards when `png` is set.
+ */
+function mutoolRun(script: string, args: readonly string[], png: boolean): string[] {
+  const cat = png ? ' && cat "$d/p.png"' : '';
+  const sh = `d=$(mktemp -d) || exit 1; trap 'rm -rf "$d"' EXIT; printf %s "$0" > "$d/s.js" && mutool run "$d/s.js" "$d/p.png" "$@"${cat}`;
+  return ['sh', '-c', sh, script, ...args];
 }
 
 function clearSearch(): void {
@@ -380,12 +520,7 @@ function rasterKey(n: number, box: Box, hl: Highlight | null = highlight(n)): st
 function rasterCommand(path: string, n: number, box: Box, hl: Highlight | null): string[] {
   const pxW = String(box.w * cellWidthPx * density);
   const pxH = String(box.h * cellHeightPx * density);
-  if (hl) {
-    // mutool run cannot write to stdout, and plugins cannot remove files when
-    // they unload, so the script and page live in a directory per render.
-    const sh = 'd=$(mktemp -d) || exit 1; trap \'rm -rf "$d"\' EXIT; printf %s "$0" > "$d/s.js" && mutool run "$d/s.js" "$d/p.png" "$@" && cat "$d/p.png"';
-    return ['sh', '-c', sh, HIGHLIGHT_SCRIPT, path, String(n), pxW, pxH, invert ? '1' : '0', hl.marks];
-  }
+  if (hl) return mutoolRun(HIGHLIGHT_SCRIPT, [path, String(n), pxW, pxH, invert ? '1' : '0', hl.marks], true);
   if (renderer === 'mutool') {
     const flags = invert ? ['-I'] : [];
     return ['mutool', 'draw', '-q', '-F', 'png', '-o', '-', '-w', pxW, '-h', pxH, ...flags, path, String(n)];
@@ -538,6 +673,7 @@ const ACTIONS: Record<string, () => boolean> = {
     if (doc) background(openDoc(doc.path, true));
     return true;
   },
+  t: openContents,
   o: () => {
     opening = true;
     pathInput.replaceText(doc?.path ?? '');
@@ -552,6 +688,66 @@ const ALIASES: Record<string, string> = {
   Down: 'j', Up: 'k', ' ': 'n', Space: 'n', PageDown: 'n', l: 'n', Right: 'n',
   Backspace: 'p', PageUp: 'p', h: 'p', Left: 'p', Home: 'g', End: 'G', w: 'f', Esc: 'q',
 };
+
+function openContents(): boolean {
+  if (outline.length === 0) {
+    notice = metaReady ? 'no table of contents' : 'reading the table of contents…';
+    return true;
+  }
+  contents = true;
+  // Start on the section the current page is in.
+  const after = outline.findIndex(entry => entry.page > page);
+  tocIndex = Math.max(0, (after === -1 ? outline.length : after) - 1);
+  return true;
+}
+
+function moveContents(delta: number): boolean {
+  const next = Math.min(outline.length - 1, Math.max(0, tocIndex + delta));
+  if (next === tocIndex) return false;
+  tocIndex = next;
+  return true;
+}
+
+function handleContentsKey(name: string): boolean {
+  const jump = half();
+  const moves: Record<string, number> = {
+    j: 1, Down: 1, k: -1, Up: -1, d: jump, PageDown: jump, ' ': jump, Space: jump, u: -jump, PageUp: -jump,
+    g: -outline.length, Home: -outline.length, G: outline.length, End: outline.length,
+  };
+  const move = moves[name];
+  if (move !== undefined) return moveContents(move);
+  if (name === 'Enter') {
+    const entry = outline[tocIndex];
+    contents = false;
+    if (entry) goTo(entry.page);
+    return true;
+  }
+  if (name === 'Esc' || name === 'q' || name === 't') {
+    contents = false;
+    return true;
+  }
+  return false;
+}
+
+function drawContents(rows: number, cols: number): string {
+  const area = Math.max(1, rows - 1);
+  tocTop = Math.min(tocIndex, Math.max(tocTop, tocIndex - area + 1));
+  const lines: string[] = [];
+  for (let y = 0; y < area; y += 1) {
+    const i = tocTop + y;
+    const entry = outline[i];
+    if (!entry) {
+      lines.push('');
+      continue;
+    }
+    const right = ` ${pageLabel(entry.page)} `;
+    const left = ` ${'  '.repeat(entry.depth)}${z.text.sanitize(entry.title)}`;
+    const width = Math.max(0, cols - z.text.width(right));
+    const line = z.text.pad(z.text.truncate(left, width), width) + right;
+    lines.push(i === tocIndex ? `\u001B[7m${line}\u001B[27m` : line);
+  }
+  return `${lines.join('\n')}\n`;
+}
 
 // oxlint-disable-next-line typescript/prefer-readonly-parameter-types -- the SDK's key type is mutable.
 function handleOpeningKey(key: Parameters<typeof pathInput.handleInputKey>[0]): boolean {
@@ -590,7 +786,7 @@ function handleCommandKey(name: string, ctrl: boolean): boolean {
     return true;
   }
   if (digits !== '' && (name === 'Enter' || name === 'Esc')) {
-    if (name === 'Enter') goTo(Number(digits));
+    if (name === 'Enter') goTo(labelledPage(digits) ?? Number(digits));
     digits = '';
     return true;
   }
@@ -620,7 +816,8 @@ function statusText(): string {
   if (error !== '') return `\u001B[31m${error}\u001B[39m`;
   if (!doc) return status === '' ? 'no document — press o to open a PDF' : status;
   const mode = fit === 'page' ? 'fit page' : 'fit width';
-  let text = `\u001B[1m${doc.title}\u001B[22m  ${page}/${doc.pages}  ${mode}`;
+  const printed = pageLabel(page) === String(page) ? '' : `p. ${pageLabel(page)}  `;
+  let text = `\u001B[1m${doc.title}\u001B[22m  ${printed}${page}/${doc.pages}  ${mode}`;
   if (invert) text += '  inverted';
   if (digits !== '') text += `  go to: ${digits}`;
   const hit = search?.hits[search.index];
@@ -634,10 +831,12 @@ function statusText(): string {
 function statusLine(cols: number): string {
   if (opening) return pathInput.render({width: cols, height: 1});
   if (searching) return searchInput.render({width: cols, height: 1});
-  const left = statusText();
-  const hint = search
+  const left = contents ? `\u001B[1mcontents\u001B[22m  ${tocIndex + 1}/${outline.length}` : statusText();
+  const hint = contents
+    ? 'j/k move  Enter go  Esc close'
+    : search
     ? 'n/N match  Esc clear  Space/p page  / search  q quit'
-    : 'j/k scroll  n/p page  / search  f fit  i invert  o open  q quit';
+    : 'j/k scroll  n/p page  / search  t contents  f fit  o open  q quit';
   const room = cols - z.text.width(left) - z.text.width(hint);
   const line = room >= 2 ? left + ' '.repeat(room) + hint : left;
   return `\u001B[7m${z.text.pad(z.text.truncate(line, cols), cols)}\u001B[0m`;
@@ -743,7 +942,14 @@ export default definePlugin({
     density = Number(config['density']) || density;
     fit = config['fit'] === 'width' ? 'width' : 'page';
     invert = config['invert'] === 'true';
-    await z.waitForPermissions(['RunCommands']);
+    await z.waitForPermissions(['RunCommands', 'PluginData']);
+    z.data.define(POSITIONS, {
+      path: {kind: 'Text', required: true, unique: true},
+      page: {kind: 'Int', required: true},
+      scroll: 'Int',
+      fit: 'Text',
+      invert: 'Bool',
+    });
     z.subscribe(['Key', 'Mouse', 'ClientGridReset']);
     await detectTools();
     const file = configuredFile(config);
@@ -758,11 +964,12 @@ export default definePlugin({
     if ('Key' in event) {
       if (opening) return handleOpeningKey(event.Key);
       if (searching) return handleSearchKey(event.Key);
+      if (contents) return handleContentsKey(z.keyName(event.Key.bare_key));
       return handleKey(z.keyName(event.Key.bare_key), event.Key.key_modifiers.includes('Ctrl'));
     }
     if ('Mouse' in event) {
-      if ('ScrollDown' in event.Mouse) return scrollBy(step(3));
-      if ('ScrollUp' in event.Mouse) return scrollBy(-step(3));
+      if ('ScrollDown' in event.Mouse) return contents ? moveContents(3) : scrollBy(step(3));
+      if ('ScrollUp' in event.Mouse) return contents ? moveContents(-3) : scrollBy(-step(3));
     }
     return false;
   },
@@ -774,7 +981,10 @@ export default definePlugin({
   render(rows, cols) {
     lastRows = rows;
     lastCols = cols;
-    const body = doc ? drawPage(doc, rows, cols) : '\n'.repeat(Math.max(0, rows - 1));
+    let body = '\n'.repeat(Math.max(0, rows - 1));
+    if (doc) body = contents ? drawContents(rows, cols) : drawPage(doc, rows, cols);
+    // Every change of position is followed by a render, so save it here.
+    remember();
     return body + statusLine(cols);
   },
 });
