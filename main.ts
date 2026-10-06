@@ -40,11 +40,12 @@ const LETTER: readonly [number, number] = [612, 792];
 const CACHE_LIMIT = 12;
 
 // Cell geometry is not exposed to plugins, so assume a typical terminal cell
-// (about twice as tall as wide) and render at a density that stays crisp on
-// hidpi displays. Kitty fits the image into its placement box preserving
-// aspect ratio, so a slightly wrong guess only costs a little margin.
-let cellWidthPx = 10;
-let cellHeightPx = 20;
+// (a little under twice as tall as wide) and render at twice that density.
+// The host scales the raster to the real cells, keeping its aspect ratio, so a
+// wrong guess costs only a little margin; erring large means hidpi cells
+// (around 23x43 px) are scaled down rather than blurred up.
+let cellWidthPx = 12;
+let cellHeightPx = 22;
 let density = 2;
 
 let doc: Doc | null = null;
@@ -408,8 +409,30 @@ async function detectTools(): Promise<void> {
   if (mutool === '') renderer = 'pdftoppm';
 }
 
+const DEFAULTS = {file: '', cell_width: '12', cell_height: '22', density: '2', fit: 'page', invert: 'false'};
+
+/**
+ * The `file` setting, percent-decoded. `yinz plugin -c` splits on every comma,
+ * so a path containing one arrives cut short, its remainder turned into
+ * value-less keys in no reliable order; say how to pass it instead of failing
+ * to open half a path.
+ */
+function configuredFile(config: Readonly<Record<string, string>>): string {
+  const stray = Object.keys(config).filter(key => !(key in DEFAULTS) && config[key] === '');
+  if (stray.length > 0) {
+    fail('file path contains a comma: write it as %2C, press o, or use `yinz pipe --name open`');
+    return '';
+  }
+  const file = config['file'] ?? '';
+  try {
+    return decodeURIComponent(file);
+  } catch {
+    return file;
+  }
+}
+
 export default definePlugin({
-  defaults: {file: '', cell_width: '10', cell_height: '20', density: '2', fit: 'page', invert: 'false'},
+  defaults: DEFAULTS,
   async load(config) {
     cellWidthPx = Number(config['cell_width']) || cellWidthPx;
     cellHeightPx = Number(config['cell_height']) || cellHeightPx;
@@ -419,7 +442,8 @@ export default definePlugin({
     await z.waitForPermissions(['RunCommands']);
     z.subscribe(['Key', 'Mouse', 'ClientGridReset']);
     await detectTools();
-    if (config['file'] !== '') await openDoc(config['file']);
+    const file = configuredFile(config);
+    if (file !== '') await openDoc(file);
   },
   update(event) {
     if (typeof event !== 'object') return false;

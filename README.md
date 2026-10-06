@@ -18,6 +18,10 @@ yinz pipe --plugin file:$PWD/main.ts --name open -- /path/to/doc.pdf
 or press `o` in the pane and type a path. Relative paths resolve against the
 pane's working directory and `~/` against `$HOME`.
 
+`yinz plugin -c` splits its argument on every comma, so a path containing one
+must be percent-encoded (`file=/books/Pachev%2C%20Sasha.pdf`); `file` is always
+percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
+
 ## Keys
 
 | Key | Action |
@@ -41,7 +45,7 @@ pane's working directory and `~/` against `$HOME`.
 | `file` | – | document to open on load |
 | `fit` | `page` | initial mode, `page` or `width` |
 | `invert` | `false` | start with inverted colours |
-| `cell_width`, `cell_height` | `10`, `20` | assumed cell size in pixels, used to shape the page box |
+| `cell_width`, `cell_height` | `12`, `22` | assumed cell size in pixels, used to shape the page box |
 | `density` | `2` | rasterisation scale relative to the assumed cell size |
 
 ## Tests

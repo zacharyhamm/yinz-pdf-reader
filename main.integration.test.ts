@@ -73,3 +73,20 @@ test('reports a missing file in the status line', {grants: ['RunCommands']}, asy
   session.loadPlugin('./main.ts', {configuration: {file: '/nonexistent/nope.pdf'}});
   await session.waitForText('nope.pdf');
 });
+
+test('opens a percent-encoded path containing a comma', {grants: ['RunCommands']}, async () => {
+  const home = session.fixture({'Pachev, Sasha.pdf': samplePdf(3)});
+  session.start({rows: 20, columns: 100});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file: `${home}/Pachev%2C%20Sasha.pdf`}});
+  await session.waitForText('1/3');
+});
+
+test('explains a path that `-c` split at a comma', {grants: ['RunCommands']}, async () => {
+  const home = session.fixture({'Pachev, Sasha.pdf': samplePdf(3)});
+  session.start({rows: 20, columns: 120});
+  await session.waitForText('yinz-test>');
+  // What `yinz plugin -c "file=$HOME/Pachev, Sasha.pdf"` delivers.
+  session.loadPlugin('./main.ts', {configuration: {file: `${home}/Pachev`, ' Sasha.pdf': ''}});
+  await session.waitForText('contains a comma');
+});
