@@ -6,7 +6,9 @@ unicode placeholders, so the image lives in the pane's cell grid and clips,
 scrolls, moves and resizes with the pane.
 
 Requires a kitty-graphics terminal (kitty, Ghostty, WezTerm, …) and `pdfinfo`
-plus `mutool` (MuPDF) or `pdftoppm` (Poppler) on the host.
+plus `mutool` (MuPDF) or `pdftoppm` (Poppler) on the host. Search uses
+`pdftotext` (Poppler, alongside `pdfinfo`); highlighting matches on the page
+needs `mutool`.
 
 ## Opening a document
 
@@ -36,7 +38,23 @@ percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
 | `i` | invert colours (mutool only) |
 | `r` | reload the document |
 | `o` | open another file |
-| `q` `Esc` | close |
+| `/` | search |
+| `n` / `N` | next / previous match while searching |
+| `Esc` | clear the search, or close when none is active |
+| `q` | close |
+
+## Searching
+
+Press `/`, type a query and press Enter. The document's text is extracted in
+the background when it opens, so searching is instant; the reader jumps to the
+first match on or after the current page and shows `match 3/61 · page 22` in
+the status line. Matches are highlighted on the page, the current one in
+orange, and in fit-width mode the view scrolls to keep it on screen.
+
+Case is ignored unless the query contains an uppercase letter, and spaces in
+the query match any run of whitespace, including line breaks. While a search
+is active `n` and `N` step through matches (wrapping at either end) and
+`Space`, `PgDn`, `p`, the arrows and so on still page.
 
 ## Configuration
 
@@ -55,4 +73,4 @@ yinz plugins test --file main.ts
 ```
 
 The integration tests build a 50-page PDF in a disposable yinz session and page,
-scroll and jump through it.
+scroll, jump and search through it.

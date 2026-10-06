@@ -3,7 +3,9 @@
 // grid: it clips, scrolls and moves with the pane like ordinary text.
 //
 // Pages are rasterised with `mutool draw` (falling back to `pdftoppm`) and page
-// geometry comes from `pdfinfo`.
+// geometry comes from `pdfinfo`. Search runs over text `pdftotext` extracts in
+// the background when a document opens; matches are located with
+// `pdftotext -bbox` and painted onto the page by a small `mutool run` script.
 //
 // Open a file:
 //   yinz plugin -c file=/path/to/doc.pdf -- file:$PWD/main.ts
@@ -13,7 +15,8 @@
 // Keys: j/k ↓/↑ scroll (or page in fit-page mode), d/u half-screen scroll,
 // Space/PgDn/n/l next page, Backspace/PgUp/p/h previous page, g/G first/last,
 // <number>Enter go to page, f toggle fit page / fit width, i invert colours,
-// r reload, o open, q/Esc close. The mouse wheel scrolls.
+// r reload, o open, q/Esc close. The mouse wheel scrolls. / searches; while a
+// search is active n/N go to the next/previous match and Esc clears it.
 import z, {definePlugin} from 'yinz:plugin';
 
 type Fit = 'page' | 'width';
@@ -34,6 +37,24 @@ interface Raster {
 interface Box {
   readonly w: number;
   readonly h: number;
+}
+
+/** A highlight rectangle in points from the crop box's top-left: x0, y0, x1, y1. */
+type Rect = readonly [number, number, number, number];
+
+interface Hit {
+  readonly page: number;
+  /** Which occurrence on its page, counting from 0. */
+  readonly k: number;
+}
+
+interface Search {
+  /** Distinguishes this search from later ones with the same query. */
+  readonly id: number;
+  readonly query: string;
+  readonly re: RegExp;
+  hits: Hit[];
+  index: number;
 }
 
 const LETTER: readonly [number, number] = [612, 792];
@@ -59,6 +80,21 @@ let error = '';
 let digits = '';
 let opening = false;
 const pathInput = z.ui.textInput({label: 'open: '});
+let searching = false;
+const searchInput = z.ui.textInput({label: '/'});
+// Each page's text with whitespace collapsed, or null until indexed.
+let texts: string[] | null = null;
+let search: Search | null = null;
+let searchId = 0;
+// A query submitted before the text was indexed.
+let queued = '';
+// A one-off search message ("no matches", "wrapped"), cleared on the next key.
+let notice = '';
+// Each page's occurrence rectangles for the active search, one rect per word.
+const boxes = new Map<number, Rect[][]>();
+const boxesPending = new Set<number>();
+// Scroll the current match into view once its page's boxes arrive.
+let revealPending = false;
 let renderer: 'mutool' | 'pdftoppm' = 'mutool';
 let homeDir = '';
 let lastRows = 0;
@@ -144,11 +180,142 @@ async function openDoc(path: string, keepPage = false): Promise<void> {
   cache.clear();
   pending.clear();
   requested = '';
+  // A reload searches the fresh text for the same query.
+  queued = keepPage ? (search?.query ?? queued) : '';
+  clearSearch();
+  texts = null;
   doc = {path: full, title: title === '' ? basename(full) : title, pages, sizes};
   page = keepPage ? Math.min(page, pages) : 1;
   if (!keepPage) scroll = 0;
   status = '';
+  background(indexText(doc));
   z.requestRender();
+}
+
+function clearSearch(): void {
+  search = null;
+  boxes.clear();
+  boxesPending.clear();
+  revealPending = false;
+}
+
+async function indexText(current: Doc): Promise<void> {
+  const result = await run(['pdftotext', '-cropbox', '-enc', 'UTF-8', current.path, '-']);
+  if (doc !== current) return;
+  if (!result.ok) {
+    queued = '';
+    notice = `search unavailable: ${result.stderr === '' ? 'pdftotext failed' : result.stderr}`;
+    z.requestRender();
+    return;
+  }
+  // Pages end with a form feed, so the text after the last one is empty.
+  const parts = z.decodeUtf8(result.stdout).split('\f');
+  texts = Array.from({length: current.pages}, (_, i) => (parts[i] ?? '').replaceAll(/\s+/gu, ' '));
+  if (queued !== '') {
+    const query = queued;
+    queued = '';
+    startSearch(query);
+  }
+  z.requestRender();
+}
+
+/** Smart case: the query ignores case unless it has an uppercase letter. */
+function matcher(query: string): RegExp | null {
+  const words = query.trim().split(/\s+/u).filter(word => word !== '');
+  if (words.length === 0) return null;
+  const source = words.map(word => word.replaceAll(/[.*+?^${}()|[\]\\]/gu, String.raw`\$&`)).join(String.raw`\s+`);
+  return new RegExp(source, /\p{Lu}/u.test(query) ? 'gu' : 'giu');
+}
+
+function startSearch(query: string): void {
+  const re = matcher(query);
+  if (!re || !doc) return;
+  clearSearch();
+  if (!texts) {
+    queued = query;
+    return;
+  }
+  const hits: Hit[] = [];
+  for (const [i, text] of texts.entries()) {
+    const count = text.match(re)?.length ?? 0;
+    for (let k = 0; k < count; k += 1) hits.push({page: i + 1, k});
+  }
+  if (hits.length === 0) {
+    notice = `no matches for "${query}"`;
+    return;
+  }
+  searchId += 1;
+  search = {id: searchId, query, re, hits, index: 0};
+  // Search forward from the current page, wrapping past the end.
+  const first = hits.findIndex(hit => hit.page >= page);
+  gotoHit(first === -1 ? 0 : first, first === -1);
+}
+
+function decodeXml(text: string): string {
+  const entities: Record<string, string> = {amp: '&', lt: '<', gt: '>', quot: '"', apos: "'"};
+  return text.replaceAll(/&(amp|lt|gt|quot|apos);/gu, (_, name: string) => entities[name] ?? '');
+}
+
+const WORD = /<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)<\/word>/gu;
+
+/**
+ * Locate page `n`'s occurrences of the active search. The words are joined
+ * with single spaces, as the indexed text was, and a match covering part of a
+ * word gets the matching fraction of that word's box.
+ */
+async function loadBoxes(current: Doc, id: number, n: number): Promise<void> {
+  boxesPending.add(n);
+  const result = await run(['pdftotext', '-cropbox', '-bbox', '-f', String(n), '-l', String(n), current.path, '-']);
+  boxesPending.delete(n);
+  const active = search;
+  if (doc !== current || active?.id !== id) return;
+  if (!result.ok) {
+    // Keep the indexed matches; the page just goes without highlights.
+    z.log(`pdftotext -bbox failed for page ${n}: ${result.stderr}`);
+    boxes.set(n, []);
+    return;
+  }
+  let joined = '';
+  const words: {start: number; end: number; rect: Rect}[] = [];
+  for (const m of z.decodeUtf8(result.stdout).matchAll(WORD)) {
+    const text = decodeXml(m[5] ?? '');
+    if (joined !== '') joined += ' ';
+    words.push({start: joined.length, end: joined.length + text.length, rect: [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]});
+    joined += text;
+  }
+  const found: Rect[][] = [];
+  for (const m of joined.matchAll(active.re)) {
+    const start = m.index;
+    const end = start + m[0].length;
+    found.push(words.filter(word => word.end > start && word.start < end).map(({start: ws, end: we, rect: [x0, y0, x1, y1]}) => {
+      const scale = (x1 - x0) / Math.max(1, we - ws);
+      return [x0 + Math.max(0, start - ws) * scale, y0, x0 + (Math.min(we, end) - ws) * scale, y1] as const;
+    }));
+  }
+  boxes.set(n, found);
+  reconcile(n, found.length);
+  if (revealPending) revealHit();
+  z.requestRender();
+}
+
+/** Trust the positioned count for page `n` if it disagrees with the index. */
+function reconcile(n: number, count: number): void {
+  const active = search;
+  if (!active) return;
+  const before = active.hits.filter(hit => hit.page < n);
+  const after = active.hits.filter(hit => hit.page > n);
+  const old = active.hits.length - before.length - after.length;
+  if (old === count) return;
+  const current = active.hits[active.index];
+  active.hits = [...before, ...Array.from({length: count}, (_, k) => ({page: n, k})), ...after];
+  if (active.hits.length === 0) {
+    clearSearch();
+    notice = `no matches for "${active.query}"`;
+    return;
+  }
+  if (current && current.page === n) active.index = before.length + Math.min(current.k, count - 1);
+  else if (current && current.page > n) active.index += count - old;
+  active.index = Math.min(active.hits.length - 1, Math.max(0, active.index));
 }
 
 /** The placement box, in cells, for page `n` in the current mode. */
@@ -169,13 +336,56 @@ function layout(current: Doc, n: number, rows: number, cols: number): Box {
   return {w, h};
 }
 
-function rasterKey(n: number, box: Box): string {
-  return `${n}:${box.w}x${box.h}:${invert ? 'i' : ''}`;
+interface Highlight {
+  readonly key: string;
+  /** [x0, y0, x1, y1, current] per rectangle, as JSON for the script. */
+  readonly marks: string;
 }
 
-function rasterCommand(path: string, n: number, box: Box): string[] {
+/** Page `n`'s highlights, once its matches are located; mutool only. */
+function highlight(n: number): Highlight | null {
+  const found = boxes.get(n);
+  if (!search || renderer !== 'mutool' || !found || found.length === 0) return null;
+  const hit = search.hits[search.index];
+  const current = hit?.page === n ? hit.k : -1;
+  const marks = found.flatMap((rects, k) => rects.map(rect => [...rect, k === current ? 1 : 0]));
+  return {key: `${search.query}#${current}`, marks: JSON.stringify(marks)};
+}
+
+// Renders a page like `mutool draw -w -h` and fills translucent rectangles over
+// the matches, after inverting so the colours survive. Arguments: output file,
+// document, page, pixel width and height, invert (1/0), marks JSON.
+const HIGHLIGHT_SCRIPT = `
+var a = scriptArgs;
+var page = Document.openDocument(a[1]).loadPage(Number(a[2]) - 1);
+var b = page.getBounds();
+var s = Math.min(Number(a[3]) / (b[2] - b[0]), Number(a[4]) / (b[3] - b[1]));
+var pix = page.toPixmap(Matrix.scale(s, s), ColorSpace.DeviceRGB, false);
+if (a[5] === '1') pix.invert();
+var dev = new DrawDevice(Matrix.identity, pix);
+var marks = JSON.parse(a[6]);
+for (var i = 0; i < marks.length; i++) {
+  var m = marks[i], path = new Path();
+  path.rect((m[0] - b[0]) * s, (m[1] - b[1]) * s, (m[2] - b[0]) * s, (m[3] - b[1]) * s);
+  dev.fillPath(path, false, Matrix.identity, ColorSpace.DeviceRGB, m[4] ? [1, 0.55, 0] : [1, 0.85, 0], m[4] ? 0.5 : 0.35);
+}
+dev.close();
+pix.asPNG().save(a[0]);
+`;
+
+function rasterKey(n: number, box: Box, hl: Highlight | null = highlight(n)): string {
+  return `${n}:${box.w}x${box.h}:${invert ? 'i' : ''}${hl ? `:${hl.key}` : ''}`;
+}
+
+function rasterCommand(path: string, n: number, box: Box, hl: Highlight | null): string[] {
   const pxW = String(box.w * cellWidthPx * density);
   const pxH = String(box.h * cellHeightPx * density);
+  if (hl) {
+    // mutool run cannot write to stdout, and plugins cannot remove files when
+    // they unload, so the script and page live in a directory per render.
+    const sh = 'd=$(mktemp -d) || exit 1; trap \'rm -rf "$d"\' EXIT; printf %s "$0" > "$d/s.js" && mutool run "$d/s.js" "$d/p.png" "$@" && cat "$d/p.png"';
+    return ['sh', '-c', sh, HIGHLIGHT_SCRIPT, path, String(n), pxW, pxH, invert ? '1' : '0', hl.marks];
+  }
   if (renderer === 'mutool') {
     const flags = invert ? ['-I'] : [];
     return ['mutool', 'draw', '-q', '-F', 'png', '-o', '-', '-w', pxW, '-h', pxH, ...flags, path, String(n)];
@@ -184,17 +394,18 @@ function rasterCommand(path: string, n: number, box: Box): string[] {
 }
 
 async function rasterize(current: Doc, n: number, box: Box): Promise<Raster | null> {
-  const key = rasterKey(n, box);
+  const hl = highlight(n);
+  const key = rasterKey(n, box, hl);
   const hit = cache.get(key);
   if (hit) return hit;
   const inflight = pending.get(key);
   if (inflight) return inflight;
   const job = (async (): Promise<Raster | null> => {
-    let result = await run(rasterCommand(current.path, n, box));
-    if (!result.ok && renderer === 'mutool') {
+    let result = await run(rasterCommand(current.path, n, box, hl));
+    if (!result.ok && renderer === 'mutool' && !hl) {
       z.log(`mutool failed (${result.stderr}); falling back to pdftoppm`);
       renderer = 'pdftoppm';
-      result = await run(rasterCommand(current.path, n, box));
+      result = await run(rasterCommand(current.path, n, box, null));
     }
     pending.delete(key);
     if (doc !== current) return null;
@@ -225,6 +436,43 @@ function goTo(n: number): boolean {
   page = target;
   scroll = 0;
   return true;
+}
+
+function gotoHit(i: number, wrapped = false): boolean {
+  if (!search || !doc) return false;
+  const hit = search.hits[i];
+  if (!hit) return false;
+  search.index = i;
+  notice = wrapped ? 'search wrapped' : '';
+  goTo(hit.page);
+  revealHit();
+  return true;
+}
+
+/** In fit-width mode, scroll the current match into view if it is off screen. */
+function revealHit(): void {
+  const hit = search?.hits[search.index];
+  revealPending = false;
+  if (!doc || !hit || hit.page !== page || fit !== 'width') return;
+  const rect = boxes.get(page)?.[hit.k]?.[0];
+  if (!rect) {
+    revealPending = true;
+    return;
+  }
+  const rows = imageRows();
+  const box = layout(doc, page, rows, lastCols);
+  const ph = (doc.sizes[page - 1] ?? LETTER)[1];
+  const top = Math.floor((rect[1] / ph) * box.h);
+  const bottom = Math.ceil((rect[3] / ph) * box.h);
+  if (top >= scroll && bottom <= scroll + rows) return;
+  scroll = Math.min(Math.max(0, box.h - rows), Math.max(0, top - Math.floor(rows / 3)));
+}
+
+function nextMatch(delta: number): boolean {
+  if (!search) return false;
+  const count = search.hits.length;
+  const i = search.index + delta;
+  return gotoHit((i + count) % count, i < 0 || i >= count);
 }
 
 /** Scroll within the page in fit-width mode, spilling over to neighbouring pages. */
@@ -279,6 +527,7 @@ const ACTIONS: Record<string, () => boolean> = {
   f: () => {
     fit = fit === 'page' ? 'width' : 'page';
     scroll = 0;
+    revealHit();
     return true;
   },
   i: () => {
@@ -317,7 +566,25 @@ function handleOpeningKey(key: Parameters<typeof pathInput.handleInputKey>[0]): 
   return true;
 }
 
+// oxlint-disable-next-line typescript/prefer-readonly-parameter-types -- the SDK's key type is mutable.
+function handleSearchKey(key: Parameters<typeof searchInput.handleInputKey>[0]): boolean {
+  const action = searchInput.handleInputKey(key);
+  if (action === 'submit') {
+    searching = false;
+    startSearch(searchInput.drainText());
+  } else if (action === 'cancel') {
+    searching = false;
+  }
+  return true;
+}
+
 function handleKey(name: string, ctrl: boolean): boolean {
+  const hadNotice = notice !== '';
+  notice = '';
+  return handleCommandKey(name, ctrl) || hadNotice;
+}
+
+function handleCommandKey(name: string, ctrl: boolean): boolean {
   if (/^[0-9]$/u.test(name) && !ctrl) {
     digits = (digits + name).slice(-6);
     return true;
@@ -329,6 +596,22 @@ function handleKey(name: string, ctrl: boolean): boolean {
   }
   const hadDigits = digits !== '';
   digits = '';
+  if (name === '/' && !ctrl) {
+    searching = true;
+    searchInput.replaceText('');
+    return true;
+  }
+  // While a search is active n/N step through matches and Esc ends the
+  // search; Space, PgDn and the rest still page through their aliases.
+  if ((search || queued !== '') && !ctrl) {
+    if (name === 'n') return nextMatch(1);
+    if (name === 'N') return nextMatch(-1);
+    if (name === 'Esc') {
+      queued = '';
+      clearSearch();
+      return true;
+    }
+  }
   const action = ACTIONS[ALIASES[name] ?? name];
   return action ? action() || hadDigits : hadDigits;
 }
@@ -340,14 +623,21 @@ function statusText(): string {
   let text = `\u001B[1m${doc.title}\u001B[22m  ${page}/${doc.pages}  ${mode}`;
   if (invert) text += '  inverted';
   if (digits !== '') text += `  go to: ${digits}`;
+  const hit = search?.hits[search.index];
+  if (search && hit) text += `  match ${search.index + 1}/${search.hits.length} · page ${hit.page}`;
+  else if (queued !== '') text += '  indexing…';
+  if (notice !== '') text += `  ${notice}`;
   if (status !== '') text += `  ${status}`;
   return text;
 }
 
 function statusLine(cols: number): string {
   if (opening) return pathInput.render({width: cols, height: 1});
+  if (searching) return searchInput.render({width: cols, height: 1});
   const left = statusText();
-  const hint = 'j/k scroll  n/p page  f fit  i invert  o open  q quit';
+  const hint = search
+    ? 'n/N match  Esc clear  Space/p page  / search  q quit'
+    : 'j/k scroll  n/p page  / search  f fit  i invert  o open  q quit';
   const room = cols - z.text.width(left) - z.text.width(hint);
   const line = room >= 2 ? left + ' '.repeat(room) + hint : left;
   return `\u001B[7m${z.text.pad(z.text.truncate(line, cols), cols)}\u001B[0m`;
@@ -364,22 +654,36 @@ function prefetch(current: Doc, area: number, cols: number): void {
   }
 }
 
+/** Start locating the current page's matches when it has some. */
+function locateMatches(current: Doc): void {
+  if (!search || renderer !== 'mutool' || boxes.has(page) || boxesPending.has(page)) return;
+  if (search.hits.some(hit => hit.page === page)) background(loadBoxes(current, search.id, page));
+}
+
+/** A raster of the current page to show while its highlights are drawn. */
+function standIn(box: Box): Raster | undefined {
+  const sent = shown.get(z.getPluginIds().client_id);
+  const sameBox = sent?.key.startsWith(`${page}:${box.w}x${box.h}:${invert ? 'i' : ''}`) === true;
+  return cache.get(rasterKey(page, box, null)) ?? (sent && sameBox ? cache.get(sent.key) : undefined);
+}
+
 function drawPage(current: Doc, rows: number, cols: number): string {
   const area = Math.max(1, rows - 1);
   const box = layout(current, page, area, cols);
   scroll = fit === 'width' ? Math.min(scroll, Math.max(0, box.h - area)) : 0;
+  locateMatches(current);
   const key = rasterKey(page, box);
-  const raster = cache.get(key);
-  if (!raster) {
-    if (requested !== key) {
-      requested = key;
-      background(rasterize(current, page, box).then(() => {
-        z.requestRender();
-      }));
-    }
-    return placeholder(`rendering page ${page}…`, area, cols);
+  const ready = cache.get(key);
+  if (ready) {
+    prefetch(current, area, cols);
+  } else if (requested !== key) {
+    requested = key;
+    background(rasterize(current, page, box).then(() => {
+      z.requestRender();
+    }));
   }
-  prefetch(current, area, cols);
+  const raster = ready ?? standIn(box);
+  if (!raster) return placeholder(`rendering page ${page}…`, area, cols);
 
   const client = z.getPluginIds().client_id;
   let head = '';
@@ -453,6 +757,7 @@ export default definePlugin({
     }
     if ('Key' in event) {
       if (opening) return handleOpeningKey(event.Key);
+      if (searching) return handleSearchKey(event.Key);
       return handleKey(z.keyName(event.Key.bare_key), event.Key.key_modifiers.includes('Ctrl'));
     }
     if ('Mouse' in event) {

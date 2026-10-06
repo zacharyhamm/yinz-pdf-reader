@@ -90,3 +90,66 @@ test('explains a path that `-c` split at a comma', {grants: ['RunCommands']}, as
   session.loadPlugin('./main.ts', {configuration: {file: `${home}/Pachev`, ' Sasha.pdf': ''}});
   await session.waitForText('contains a comma');
 });
+
+test('searches forward through matches with smart case', {grants: ['RunCommands']}, async () => {
+  const file = sample();
+  session.start({rows: 40, columns: 120});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file}});
+  await session.waitForText('1/50');
+  // "Page 4" and "Page 40" to "Page 49".
+  session.key('/');
+  session.text('Page 4');
+  session.key('Enter');
+  await session.waitForText('match 1/11 · page 4');
+  session.key('n');
+  await session.waitForText('match 2/11 · page 40');
+  session.key('N');
+  await session.waitForText('match 1/11 · page 4');
+  session.key('N');
+  await session.waitForText('match 11/11 · page 49');
+  await session.waitForText('search wrapped');
+  session.key('/');
+  // Lowercase ignores case; the search starts from the current page, 49.
+  session.text('page 4');
+  session.key('Enter');
+  await session.waitForText('match 11/11 · page 49');
+  session.key('/');
+  session.text('PAGE 4');
+  session.key('Enter');
+  await session.waitForText('no matches for "PAGE 4"');
+  assert(!session.logs.includes('Error'), session.logs);
+});
+
+test('Esc ends a search and n pages again', {grants: ['RunCommands']}, async () => {
+  const file = sample();
+  session.start({rows: 40, columns: 120});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file}});
+  await session.waitForText('1/50');
+  session.key('/');
+  session.text('Page 7');
+  session.key('Enter');
+  await session.waitForText('match 1/1 · page 7');
+  // Space still pages while a search is active.
+  session.key('Space');
+  await session.waitForText('8/50');
+  session.key('n');
+  await session.waitForText('7/50');
+  session.key('Esc');
+  session.key('n');
+  await session.waitForText('8/50');
+});
+
+test('search lands on the match in fit width', {grants: ['RunCommands']}, async () => {
+  const file = sample();
+  session.start({rows: 30, columns: 100});
+  await session.waitForText('yinz-test>');
+  session.loadPlugin('./main.ts', {configuration: {file, fit: 'width'}});
+  await session.waitForText('1/50  fit width');
+  session.key('/');
+  session.text('Page 12');
+  session.key('Enter');
+  await session.waitForText('12/50  fit width  match 1/1 · page 12');
+  assert(!session.logs.includes('Error'), session.logs);
+});
