@@ -8,8 +8,8 @@
 // `pdftotext -bbox` and painted onto the page by a small `mutool run` script.
 //
 // Open a file:
-//   yinz plugin -c file=/path/to/doc.pdf -- file:$PWD/main.ts
-//   yinz pipe --plugin file:$PWD/main.ts --name open -- /path/to/doc.pdf
+//   yinz plugin --floating --configuration-json '{"file":"/path/to/doc.pdf"}' -- file:///path/to/main.ts
+//   yinz pipe --plugin file:///path/to/main.ts --name open -- /path/to/doc.pdf
 // or press `o` inside the pane and type a path.
 //
 // Keys: j/k ↓/↑ scroll (or page in fit-page mode), d/u half-screen scroll,
@@ -149,7 +149,7 @@ function background(job: Promise<unknown>): void {
 }
 
 function resolvePath(path: string): string {
-  let p = path.trim();
+  let p = path;
   if (p.startsWith('~/')) p = homeDir + p.slice(1);
   if (!p.startsWith('/')) p = `${z.getPluginIds().initial_cwd.replace(/\/$/u, '')}/${p}`;
   return p;
@@ -698,7 +698,7 @@ const ACTIONS: Record<string, () => boolean> = {
     return true;
   },
   r: () => {
-    if (doc) background(openDoc(doc.path, true));
+    if (doc) queueOpen(doc.path, true);
     return true;
   },
   t: openContents,
@@ -798,9 +798,9 @@ function drawContents(rows: number, cols: number): string {
 function handleOpeningKey(key: Parameters<typeof pathInput.handleInputKey>[0]): boolean {
   const action = pathInput.handleInputKey(key);
   if (action === 'submit') {
-    const path = pathInput.drainText();
+    const path = pathInput.drainText().trim();
     opening = false;
-    if (path.trim() !== '') background(openDoc(path));
+    if (path !== '') queueOpen(path);
   } else if (action === 'cancel') {
     opening = false;
   }
@@ -952,6 +952,7 @@ function drawPage(current: Doc, rows: number, cols: number): string {
 
 async function detectTools(): Promise<void> {
   const probe = await run(['sh', '-c', 'echo "$HOME"; command -v mutool || true']);
+  if (!probe.ok) throw new Error(probe.stderr || 'could not detect PDF tools; reload to retry');
   const [home = '', mutool = ''] = z.decodeUtf8(probe.stdout).split('\n');
   homeDir = home;
   if (mutool === '') {
@@ -970,46 +971,43 @@ async function detectTools(): Promise<void> {
 
 const DEFAULTS = {file: '', cell_width: '12', cell_height: '22', density: '2', fit: 'page', invert: 'false'};
 
-/**
- * The `file` setting, percent-decoded. `yinz plugin -c` splits on every comma,
- * so a path containing one arrives cut short, its remainder turned into
- * value-less keys in no reliable order; say how to pass it instead of failing
- * to open half a path.
- */
-function configuredFile(config: Readonly<Record<string, string>>): string {
-  const stray = Object.keys(config).filter(key => !(key in DEFAULTS) && config[key] === '');
-  if (stray.length > 0) {
-    fail('file path contains a comma: write it as %2C, press o, or use `yinz pipe --name open`');
-    return '';
-  }
-  const file = config['file'] ?? '';
-  try {
-    return decodeURIComponent(file);
-  } catch {
-    return file;
-  }
+let initialization: Promise<void>;
+let opens = Promise.resolve();
+
+function queueOpen(path: string, keepPage = false): void {
+  opens = opens.then(async () => {
+    await initialization;
+    await openDoc(path, keepPage);
+  }).catch((reason: unknown) => {
+    fail(String(reason));
+  });
+}
+
+async function initialize(): Promise<void> {
+  await z.waitForPermissions(['RunCommands', 'PluginData']);
+  z.data.define(POSITIONS, {
+    path: {kind: 'Text', required: true, unique: true},
+    page: {kind: 'Int', required: true},
+    scroll: 'Int',
+    fit: 'Text',
+    invert: 'Bool',
+  });
+  await detectTools();
 }
 
 export default definePlugin({
   defaults: DEFAULTS,
-  async load(config) {
+  load(config) {
     cellWidthPx = Number(config['cell_width']) || cellWidthPx;
     cellHeightPx = Number(config['cell_height']) || cellHeightPx;
     density = Number(config['density']) || density;
     fit = config['fit'] === 'width' ? 'width' : 'page';
     invert = config['invert'] === 'true';
-    await z.waitForPermissions(['RunCommands', 'PluginData']);
-    z.data.define(POSITIONS, {
-      path: {kind: 'Text', required: true, unique: true},
-      page: {kind: 'Int', required: true},
-      scroll: 'Int',
-      fit: 'Text',
-      invert: 'Bool',
-    });
+    initialization = initialize();
+    background(initialization);
     z.subscribe(['Key', 'Mouse', 'ClientGridReset']);
-    await detectTools();
-    const file = configuredFile(config);
-    if (file !== '') await openDoc(file);
+    const file = config['file'] ?? '';
+    if (file !== '') queueOpen(file);
   },
   async unload() {
     if (scratch !== '') await run(['rm', '-rf', scratch]);
@@ -1033,8 +1031,8 @@ export default definePlugin({
     return false;
   },
   pipe(message) {
-    if (message.name !== 'open' || message.payload === null) return false;
-    background(openDoc(message.payload));
+    if (message.name !== 'open' || (message.payload === null || message.payload === '')) return false;
+    queueOpen(message.payload);
     return true;
   },
   render(rows, cols) {

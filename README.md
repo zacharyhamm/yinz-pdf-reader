@@ -16,16 +16,64 @@ remember where each document was left.
 ## Opening a document
 
 ```sh
-yinz plugin --floating -c file=/path/to/doc.pdf -- file:$PWD/main.ts
-yinz pipe --plugin file:$PWD/main.ts --name open -- /path/to/doc.pdf
+yinz plugin --floating \
+  --configuration-json '{"file":"/books/Pachev, Sasha #?%2C 雪.pdf"}' \
+  -- 'file:///path/to/yinz-pdf-reader/main.ts'
+yinz pipe --plugin 'file:///path/to/yinz-pdf-reader/main.ts' --name open -- /path/to/doc.pdf
 ```
 
-or press `o` in the pane and type a path. Relative paths resolve against the
-pane's working directory and `~/` against `$HOME`.
+Or press `o` in the pane and type a path. Relative paths resolve against the
+pane's working directory and `~/` against `$HOME`. Typed input trims surrounding
+whitespace; JSON configuration and messages preserve it.
 
-`yinz plugin -c` splits its argument on every comma, so a path containing one
-must be percent-encoded (`file=/books/Pachev%2C%20Sasha.pdf`); `file` is always
-percent-decoded. Opening through `o` or `yinz pipe` needs no encoding.
+Document paths are literal: commas, spaces, and percent sequences need no
+encoding in JSON configuration, messages, or typed opening. Plugin locations
+are escaped URLs; escape spaces, `#`, `?`, `%`, and other special characters.
+
+Rewrite previously encoded `file` settings once: `Pachev%2C%20Sasha.pdf` becomes
+`Pachev, Sasha.pdf`. There is no automatic decoding or existence-based fallback:
+a real `%2C` filename remains distinct from a comma filename. Saved positions
+need no migration because their keys already use resolved document paths.
+
+## From the command palette
+
+`palette.ts` adds **Open PDF…** to the command palette (`Ctrl Alt p`). It opens
+the builtin file finder (fzf, so `fzf` must be on `PATH`) listing every PDF in
+the focused pane's git project: the main checkout and each of its worktrees,
+tracked or untracked but not ignored. Outside a checkout it lists the PDFs
+under the pane's directory, excluding hidden directories and files. Extensions
+are case-insensitive; deleted and ignored files are excluded in git checkouts.
+The finder supports UTF-8 filenames without newlines. The chosen file opens in
+a floating reader pane. Later picks open in that same reader while it is running. The finder launches
+through your `file-finder` alias, so its geometry and custom `fzf_args` apply.
+The PDF launch overrides only `overlay`, `file_command`, and `openers_json`.
+Configuration merges replace whole values, including the opener map. Persistent
+alias settings stay unchanged. The finder sends the literal path directly to
+the reader; manual `yinz pipe --name open` remains supported.
+
+Find the action with “pdf reader”, “open document”, “pdf open”, or “read pdf”.
+Native palette matching and ranking determine the results. Opens wait for
+permissions and tool initialization, then run in arrival order. Individual open
+failures do not stop later selections. Initialization failure or permission
+denial requires reloading the plugin to retry. Sequential selections reuse the
+reader; simultaneous independent finders can still launch separate readers.
+
+Load it in the background in your yinz configuration:
+
+```kdl
+load_plugins {
+    "file:///path/to/yinz-pdf-reader/palette.ts" {
+        shared true
+    }
+}
+```
+
+`shared true` exposes the provider to every client in the session. Escape
+special characters in the plugin URL. No manifest or autoload system is needed.
+
+It asks for `ReadApplicationState` to register the action and `RunActionsAsUser`
+to open the finder. A cold reader displays its permission prompt before opening
+the selected PDF. The finder retires whether permission is granted or denied.
 
 ## Keys
 
@@ -93,9 +141,17 @@ is active `n` and `N` step through matches (wrapping at either end) and
 ## Tests
 
 ```sh
-yinz plugins test --file main.ts
+/home/zacharyhamm/.local/bin/yinz plugins check --file main.ts --json
+/home/zacharyhamm/.local/bin/yinz plugins check --file palette.ts --json
+/home/zacharyhamm/.local/bin/yinz plugins test --file main.ts --kind all --timeout-ms 60000 --json
+/home/zacharyhamm/.local/bin/yinz plugins test --file palette.ts --kind all --timeout-ms 60000 --json
 ```
 
-The integration tests build a 50-page PDF in a disposable yinz session and page,
-scroll, jump and search through it; a variant with an outline and page labels
-covers the table of contents, and a reload checks the saved position.
+Use the current installed binary: an older `yinz` on `PATH` can report the same
+version while lacking the palette and testing APIs used here.
+
+Unit tests cover static palette handles, structured opener configuration,
+permission/tool readiness, FIFO opening, and failure recovery. Integration tests
+use real disposable sessions, PDF tools, palette input, and fzf. They cover
+paging, search, outlines, saved positions, literal filenames, escaped plugin
+URLs, git worktrees, permission prompts, cancellation, and reader reuse.
