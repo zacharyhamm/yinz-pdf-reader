@@ -4,9 +4,14 @@
 //
 // Load it in the background, so the action is there in every session:
 //   load_plugins { "file:///path/to/yinz-pdf-reader/palette.ts" { shared true; }; }
+// Installed from git, set `reader` to the reader's alias, so picks reach the
+// same reader identity whichever commit is installed.
 import z, {definePlugin, type Action, type PaletteAction} from 'yinz:plugin';
 
 export const READER = import.meta.resolve('./main.ts');
+
+/** Where picks are sent: an alias or absolute location, the sibling main.ts by default. */
+let reader = READER;
 
 /**
  * Every PDF git tracks or would track (untracked but not ignored) in each
@@ -36,13 +41,13 @@ export const LIST = [
  * `overlay` is read by the host, not the finder, and matches the default
  * keybinding's launch.
  */
-export function finderLaunch(): Action {
+export function finderLaunch(target = reader): Action {
   return {
     LaunchOrFocusPlugin: {
       plugin: {
         Alias: {
           name: 'file-finder',
-          configuration: {overlay: 'true', file_command: LIST, openers_json: JSON.stringify({pdf: {plugin: READER, message: 'open'}})},
+          configuration: {overlay: 'true', file_command: LIST, openers_json: JSON.stringify({pdf: {plugin: target, message: 'open'}})},
           initial_cwd: null,
           run_plugin: null,
         },
@@ -68,8 +73,9 @@ const OPEN_PDF: PaletteAction = {
 };
 
 export default definePlugin({
-  defaults: {},
-  async load() {
+  defaults: {reader: ''},
+  async load(config) {
+    reader = config['reader'] || READER;
     await z.waitForPermissions(['ReadApplicationState', 'RunActionsAsUser']);
     z.commandPalette.registerProvider({
       id: 'pdf-reader',

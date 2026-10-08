@@ -71,6 +71,26 @@ load_plugins {
 `shared true` exposes the provider to every client in the session. Escape
 special characters in the plugin URL. No manifest or autoload system is needed.
 
+To install from GitHub instead of a local checkout, declare both entrypoints as
+repository plugins and load the palette by alias. `reader` points picks at the
+reader's alias, so permissions and saved positions follow it across updates:
+
+```kdl
+plugins {
+    pdf-reader repo="https://github.com/zacharyhamm/yinz-pdf-reader.git" branch="main"
+    pdf-palette repo="https://github.com/zacharyhamm/yinz-pdf-reader.git" branch="main" entrypoint="palette.ts" {
+        shared true
+        reader "pdf-reader"
+    }
+}
+load_plugins {
+    "pdf-palette"
+}
+```
+
+`yinz plugins update pdf-reader pdf-palette` fetches new commits; reload the
+running plugins to use them.
+
 It asks for `ReadApplicationState` to register the action and `RunActionsAsUser`
 to open the finder. A cold reader displays its permission prompt before opening
 the selected PDF. The finder retires whether permission is granted or denied.

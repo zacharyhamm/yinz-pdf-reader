@@ -37,3 +37,21 @@ test('static palette inventory launches the alias and releases dismissed handles
   await plugin.palette({type: 'execute', scope: {...reopened, revision: 2}, context, handle: fresh.handle, values: null}, 1);
   assertEquals(launches().length, 1);
 });
+
+test('a configured reader alias receives the picks', async () => {
+  const plugin = await loadPlugin('./palette.ts', {configuration: {reader: 'pdf-reader'}, replies: {RequestPluginPermissions: null, CommandPalette: null, RunAction: null}});
+  await plugin.event({PermissionRequestResult: 'Granted'});
+  const registration = plugin.paletteCommands.find(c => c.type === 'register');
+  assert(registration?.type === 'register');
+  const context = {clientId: 1, paneId: {Terminal: 7}, tabId: 1, currentProject: null};
+  const scope = {registration: registration.registration, opening: 1, view: 0, revision: 1};
+  await plugin.palette({type: 'discover', scope, context, query: '', source: null}, 1);
+  const reply = plugin.paletteCommands.at(-1);
+  assert(reply?.type === 'reply' && 'Ok' in reply.result && reply.result.Ok.type === 'actions');
+  const [action] = reply.result.Ok.actions;
+  assert(action);
+  await plugin.palette({type: 'execute', scope: {...scope, revision: 2}, context, handle: action.handle, values: null}, 1);
+  const launch = plugin.commands.find((c): c is {RunAction: [{LaunchOrFocusPlugin: {plugin: {Alias: {configuration: Record<string, string>}}}}, unknown]} => typeof c === 'object' && c !== null && 'RunAction' in c);
+  assert(launch);
+  assertEquals(JSON.parse(launch.RunAction[0].LaunchOrFocusPlugin.plugin.Alias.configuration['openers_json']!), {pdf: {plugin: 'pdf-reader', message: 'open'}});
+});
