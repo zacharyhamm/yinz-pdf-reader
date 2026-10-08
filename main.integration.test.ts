@@ -465,3 +465,24 @@ mkdir -p "$HOME/${sourceDir}"\ncp ${quote(source)} "$HOME/${sourceDir}/"`,
   const id = readers(target)[0]?.id;
   assert(id !== undefined);
 });
+
+test('a reader alias configured on the palette receives the pick', PALETTE_GRANTS, async () => {
+  const reader = import.meta.resolve('./main.ts');
+  session.fixture({
+    'aliased.pdf': samplePdf(6),
+    'alias.kdl': `plugins { pdf-reader location=${JSON.stringify(reader)}; }\n`,
+  }, {setup: `set -eu
+${cliSocket}
+${CLI} action reconfigure --file "$HOME/alias.kdl"
+echo FIXTURE_READY`});
+  session.start({rows: 35, columns: 160, backgroundPlugins: [{path: './palette.ts', configuration: {reader: 'pdf-reader'}}]});
+  await session.waitForText('yinz-test>');
+  session.text('setup');
+  session.key('Enter');
+  await session.waitForText('FIXTURE_READY');
+  await paletteFinder();
+  await choose('aliased.pdf', 6, true);
+  // The pane carries the alias, not the file, so its identity survives updates.
+  assertEquals(session.panes.filter(p => p.is_plugin && p.plugin_url === 'pdf-reader').length, 1);
+  assertEquals(readers().length, 0);
+});
