@@ -126,7 +126,7 @@ the selected PDF. The finder retires whether permission is granted or denied.
 | *number* `Enter` | go to page: the printed page label if the PDF has labels, else the PDF page |
 | `t` | table of contents |
 | `f` / `w` | toggle fit page / fit width |
-| `i` | invert colours (mutool only) |
+| `i` | invert colours (mutool only; without it the status line says so) |
 | `r` | reload the document |
 | `o` | open another file |
 | `/` | search |
@@ -152,7 +152,8 @@ page carries is reported rather than taken as a PDF page.
 ## Reopening where you left off
 
 The page, scroll position, fit mode and inversion are saved for each file and
-restored when it is opened again. `r` reloads in place.
+restored when it is opened again. `r` reloads in place, keeping an active search
+without jumping to its next match.
 
 ## Searching
 
@@ -216,7 +217,11 @@ fallback geometry is a guess and draws at density 2. A configured `density`
 overrides both. Density drops only when the raster would exceed the
 host's image limits (10000 pixels a side, 100 MiB decoded), as a full-screen pane
 with large cells can; that page is drawn at the largest scale that fits and
-still fills its box. Client ids are not reused, so a reattaching client is sent the page
+still fills its box. A PNG over the 8 MiB transfer limit, such as a scanned page
+in a large pane, is drawn again smaller until it fits. Zero cell-pixel reports
+count as unknown. A page that fails to render shows its error in place of the
+page, without affecting other pages; a page mutool cannot draw is drawn with
+pdftoppm instead, and a page whose search highlights fail is shown without them. Client ids are not reused, so a reattaching client is sent the page
 image again without a grid-reset event.
 
 The large-page regression uses `/usr/bin/python3` to generate a deterministic

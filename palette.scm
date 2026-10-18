@@ -16,7 +16,9 @@
 ;; tree. Outside a checkout, the PDFs under the directory, hidden ones left
 ;; out. Paths are absolute, as the reader does not open in the finder's
 ;; directory, and are joined with printf so no character in them is special.
-;; git's errors would draw over fzf, so they are dropped.
+;; git lists them NUL-separated, as it quotes some names in its line output;
+;; names with newlines cannot be a finder line and are skipped. git's errors
+;; would draw over fzf, so they are dropped.
 (define LIST
   (string-join
     (list
@@ -24,8 +26,9 @@
       "  git worktree list --porcelain 2>/dev/null |"
       "  awk '/^worktree /{w=substr($0,10)} /^(bare|prunable)/{w=\"\"} /^$/{if(w!=\"\")print w; w=\"\"} END{if(w!=\"\")print w}' |"
       "  while IFS= read -r w; do"
-      "    git -C \"$w\" -c core.quotePath=false ls-files -co --exclude-standard -- ':(icase)*.pdf' 2>/dev/null |"
-      "    while IFS= read -r f; do [ -f \"$w/$f\" ] && printf '%s/%s\\n' \"$w\" \"$f\"; done"
+      "    git -C \"$w\" ls-files -z -co --exclude-standard -- ':(icase)*.pdf' 2>/dev/null |"
+      "    xargs -0 sh -c 'for f; do case $f in *\""
+      "\"*) continue;; esac; [ ! -f \"$0/$f\" ] || printf \"%s/%s\\n\" \"$0\" \"$f\"; done' \"$w\""
       "  done"
       "else"
       "  find \"$PWD\" -mindepth 1 -name '.*' -prune -o -type f -iname '*.pdf' -print"

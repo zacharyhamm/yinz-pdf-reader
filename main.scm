@@ -64,8 +64,10 @@
 ;; k counting occurrences on its page from 0) and "index".
 (define search #f)
 (define search-id 0)
-;; A query submitted before the text was indexed.
+;; A query submitted before the text was indexed, and whether it should leave
+;; the position alone (a reload) rather than go to the first match.
 (define queued "")
+(define queued-in-place #f)
 ;; A one-off search message ("no matches", "wrapped"), cleared on the next key.
 (define notice "")
 ;; Each page's occurrence rectangles for the active search, one rect per word.
@@ -84,8 +86,10 @@
 (define contents #f)
 (define toc-index 0)
 (define toc-top 0)
-;; The position last written to the data store, to skip unchanged writes.
+;; The position last written to the data store, to skip unchanged writes, and
+;; whether a write is already scheduled.
 (define saved "")
+(define save-pending #f)
 (define renderer "mutool")
 (define home-dir "")
 (define initial-cwd "")
@@ -103,10 +107,13 @@
 ;; never reused, so a reattaching client has no entry and gets the image anew.
 (define next-id (+ 1 (yinz-random-integer (- yinz-ui-image-max-id 1000000))))
 (define shown (hash))
-;; Rasters by key, "key" and "png", oldest first in cache-order.
+;; Rasters by key, "key" and "png", oldest first in cache-order. Keys that
+;; failed map to their message in `broken`, so they are not retried until the
+;; document reloads or the geometry changes.
 (define cache (hash))
 (define cache-order '())
 (define pending (hash))
+(define broken (hash))
 
 ;; ---------------------------------------------------------------------------
 ;; Small helpers: JavaScript's rounding and number printing, lookups, deferreds.
@@ -203,12 +210,19 @@
             (yinz-then (page-sizes full pages)
               (lambda (sizes) (show-doc full title pages sizes keep-page)))))))))
 
-(define (show-doc full title pages sizes keep-page)
+(define (forget-rasters)
   (set! cache (hash))
   (set! cache-order '())
+  (set! broken (hash))
+  (set! requested ""))
+
+(define (show-doc full title pages sizes keep-page)
+  ;; The outgoing document's position may not be saved yet.
+  (remember)
+  (forget-rasters)
   (set! pending (hash))
-  (set! requested "")
-  ;; A reload searches the fresh text for the same query.
+  ;; A reload searches the fresh text for the same query, staying where it is.
+  (set! queued-in-place (and keep-page (if search #t queued-in-place)))
   (set! queued (if keep-page (if search (hash-ref search "query") queued) ""))
   (clear-search)
   (set! texts #f)
@@ -257,10 +271,12 @@
                 "fit" (if (equal? (get row "fit" json-null) "width") "width" "page")
                 "invert" (equal? (get row "invert" json-null) #t)))))))
 
+(define (position) (string-append (num->string page) ":" (num->string scroll) ":" fit ":" (if invert "true" "false")))
+
 ;; Save the current position when it has changed.
 (define (remember)
   (when doc
-    (let ([now (string-append (num->string page) ":" (num->string scroll) ":" fit ":" (if invert "true" "false"))])
+    (let ([now (position)])
       (unless (equal? now saved)
         (set! saved now)
         (with-handler
@@ -270,6 +286,15 @@
               (list (list "path" (hash-ref doc "path")) (list "page" page)
                     (list "scroll" scroll) (list "fit" fit) (list "invert" invert))
               (hash "uid" (hash-ref doc "path"))))))))))
+
+;; Write the position shortly after it changes, outside the render, so that
+;; holding a key down does not write on every step. Unload saves what is left.
+(define (schedule-save)
+  (unless (or save-pending (not doc) (equal? (position) saved))
+    (set! save-pending #t)
+    (yinz-catch
+      (yinz-then (yinz-sleep 500) (lambda (_) (set! save-pending #f) (remember)))
+      (lambda (reason) (set! save-pending #f) (yinz-log (string-append "could not save the position: " (message-of reason)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The outline and printed page labels.
@@ -386,7 +411,7 @@ print(JSON.stringify(out));
             (unless (equal? queued "")
               (let ([query queued])
                 (set! queued "")
-                (start-search query)))
+                (start-search query queued-in-place)))
             (yinz-request-render)))))))
 
 (define (hit-page hit) (car hit))
@@ -396,13 +421,14 @@ print(JSON.stringify(out));
 (define (set-search! key value) (set! search (hash-insert search key value)))
 (define (current-hit) (and search (vector-at (search-hits) (search-index) #f)))
 
-;; Smart case: the query ignores case unless it has an uppercase letter.
-(define (start-search query)
+;; Smart case: the query ignores case unless it has an uppercase letter. In
+;; place, the current match is the next one but the position stays put.
+(define (start-search query in-place)
   (define matcher (text-matcher query))
   (when (and matcher doc)
     (clear-search)
     (if (not texts)
-      (set! queued query)
+      (begin (set! queued query) (set! queued-in-place in-place))
       (let ([hits (list->vector
                     (apply append
                       (map (lambda (i)
@@ -416,7 +442,9 @@ print(JSON.stringify(out));
             (set! search (hash "id" search-id "query" query "matcher" matcher "hits" hits "index" 0))
             ;; Search forward from the current page, wrapping past the end.
             (let ([first (index-where (lambda (hit) (>= (hit-page hit) page)) hits)])
-              (goto-hit (if (= first -1) 0 first) (= first -1)))))))))
+              (if in-place
+                (set-search! "index" (if (= first -1) 0 first))
+                (goto-hit (if (= first -1) 0 first) (= first -1))))))))))
 
 ;; Locate page `n`'s occurrences of the active search. The words are joined
 ;; with single spaces, as the indexed text was, and a match covering part of a
@@ -549,35 +577,44 @@ dev.close();
 pix.asPNG().save(a[0]);
 ")
 
-(define (box-prefix n box)
-  (string-append (num->string n) ":" (num->string (box-w box)) "x" (num->string (box-h box)) ":"
-    (num->string cell-width-px) "x" (num->string cell-height-px) "@" (num->string density) ":" (if invert "i" "")))
-(define (raster-key n box hl)
-  (string-append (box-prefix n box) (if hl (string-append ":" (hash-ref hl "key")) "")))
+;; pdftoppm cannot invert, so inversion only applies with mutool.
+(define (inverted?) (and invert (equal? renderer "mutool")))
+
+;; The document serial keeps one opening's rasters from standing in for
+;; another's, and the inversion mark is one character so neither prefix is a
+;; prefix of the other.
+(define (box-prefix current n box)
+  (string-append (num->string (hash-ref current "serial")) "/" (num->string n) ":"
+    (num->string (box-w box)) "x" (num->string (box-h box)) ":"
+    (num->string cell-width-px) "x" (num->string cell-height-px) "@" (num->string density) ":" (if (inverted?) "i" "-")))
+(define (raster-key current n box hl)
+  (string-append (box-prefix current n box) (if hl (string-append ":" (hash-ref hl "key")) "")))
 
 ;; The host decodes images to RGBA and refuses any side over 10000 pixels or any
 ;; image over 100 MiB, so a box too big for that at `density` (a full-screen
 ;; pane with large cells) is drawn at the largest scale that fits; the
 ;; placement still fills the box. The 2% margin covers pdftoppm deriving the
-;; height from the page rather than the box.
+;; height from the page rather than the box. A PNG over the host's 8 MiB limit
+;; is drawn again `shrink` times smaller.
 (define MAX-RASTER-SIDE 9800)
 (define MAX-RASTER-PIXELS (* 0.98 (/ 104857600 4)))
+(define SHRINK-TRIES 3)
 
 ;; The raster size in pixels for `box`: (w . h).
-(define (raster-pixels box cell-width cell-height)
+(define (raster-pixels box cell-width cell-height shrink)
   (let* ([w (* (box-w box) cell-width density)]
          [h (* (box-h box) cell-height density)]
-         [s (min (min 1 (/ MAX-RASTER-SIDE (max w h))) (sqrt (/ MAX-RASTER-PIXELS (* w h))))])
+         [s (* shrink (min (min 1 (/ MAX-RASTER-SIDE (max w h))) (sqrt (/ MAX-RASTER-PIXELS (* w h)))))])
     (cons (max 1 (js-floor (* w s))) (max 1 (js-floor (* h s))))))
 
-(define (raster-command path n box hl cell-width cell-height)
-  (define pixels (raster-pixels box cell-width cell-height))
+(define (raster-command path n box hl cell-width cell-height tool shrink)
+  (define pixels (raster-pixels box cell-width cell-height shrink))
   (define px-w (num->string (car pixels)))
   (define px-h (num->string (cdr pixels)))
   (cond
-    [hl (mutool-run "highlight.js" (list path (num->string n) px-w px-h (if invert "1" "0") (hash-ref hl "marks")) #t)]
-    [(equal? renderer "mutool")
-      (append (list "mutool" "draw" "-q" "-F" "png" "-o" "-" "-w" px-w "-h" px-h) (if invert (list "-I") '()) (list path (num->string n)))]
+    [hl (mutool-run "highlight.js" (list path (num->string n) px-w px-h (if (inverted?) "1" "0") (hash-ref hl "marks")) #t)]
+    [(equal? tool "mutool")
+      (append (list "mutool" "draw" "-q" "-F" "png" "-o" "-" "-w" px-w "-h" px-h) (if (inverted?) (list "-I") '()) (list path (num->string n)))]
     [else (list "pdftoppm" "-png" "-f" (num->string n) "-l" (num->string n) "-scale-to-x" px-w "-scale-to-y" "-1" path)]))
 
 (define (cache-put! key raster)
@@ -589,34 +626,50 @@ pix.asPNG().save(a[0]);
       (set! cache-order (cdr cache-order))
       (evict))))
 
-;; A deferred raster ("key" and "png") of page `n`, or #f.
-(define (rasterize current n box)
+;; Page `n`'s highlights, unless drawing them already failed for this box.
+(define (page-highlight current n box)
+  (define hl (highlight n))
+  (and hl (not (hash-contains? broken (raster-key current n box hl))) hl))
+
+(define (png-size result) (bytes-length (hash-ref result "stdout")))
+
+;; A deferred raster ("key" and "png") of page `n`, or #f. A page mutool cannot
+;; draw is drawn with pdftoppm, without changing the renderer for other pages.
+(define (rasterize current n box hl)
   (define cell-width cell-width-px)
   (define cell-height cell-height-px)
-  (define hl (highlight n))
-  (define key (raster-key n box hl))
+  (define key (raster-key current n box hl))
+  (define (attempt tool shrink tries)
+    (yinz-then (run (raster-command (hash-ref current "path") n box hl cell-width cell-height tool shrink))
+      (lambda (result)
+        (cond
+          [(and (not (ok? result)) (equal? tool "mutool") (not hl))
+            (yinz-log (string-append "mutool failed on page " (num->string n) " (" (stderr-text result) "); trying pdftoppm"))
+            (attempt "pdftoppm" shrink tries)]
+          [(and (ok? result) (> (png-size result) yinz-ui-image-max-bytes) (> tries 0))
+            (attempt tool (* shrink 0.9 (sqrt (/ yinz-ui-image-max-bytes (png-size result)))) (- tries 1))]
+          [else (finish-raster current n key result)]))))
   (cond
     [(hash-contains? cache key) (resolved (hash-ref cache key))]
     [(hash-contains? pending key) (hash-ref pending key)]
+    [(hash-contains? broken key) (resolved #f)]
     [else
-      (let ([job (yinz-then (run (raster-command (hash-ref current "path") n box hl cell-width cell-height))
-                   (lambda (result)
-                     (if (and (not (ok? result)) (equal? renderer "mutool") (not hl))
-                       (begin
-                         (yinz-log (string-append "mutool failed (" (stderr-text result) "); falling back to pdftoppm"))
-                         (set! renderer "pdftoppm")
-                         (yinz-then (run (raster-command (hash-ref current "path") n box #f cell-width cell-height))
-                           (lambda (retry) (finish-raster current n key retry))))
-                       (finish-raster current n key result))))])
+      (let ([job (attempt (if hl "mutool" renderer) 1 SHRINK-TRIES)])
         (set! pending (hash-insert pending key job))
         job)]))
 
 (define (finish-raster current n key result)
+  (define problem
+    (cond
+      [(not (ok? result)) (if (equal? (stderr-text result) "") "the renderer failed" (stderr-text result))]
+      [(> (png-size result) yinz-ui-image-max-bytes) "the page image is too large"]
+      [else #f]))
   (set! pending (hash-remove pending key))
   (cond
     [(not (doc-is? current)) #f]
-    [(not (ok? result))
-      (fail (if (equal? (stderr-text result) "") (string-append "could not render page " (num->string n)) (stderr-text result)))
+    [problem
+      (yinz-log (string-append "could not render page " (num->string n) ": " problem))
+      (set! broken (hash-insert broken key problem))
       #f]
     [else
       (let ([raster (hash "key" key "png" (hash-ref result "stdout"))])
@@ -712,7 +765,10 @@ pix.asPNG().save(a[0]);
         (set! scroll 0)
         (reveal-hit)
         #t)]
-    [(equal? name "i") (lambda () (set! invert (not invert)) #t)]
+    [(equal? name "i")
+      (lambda ()
+        (if (equal? renderer "mutool") (set! invert (not invert)) (set! notice "inverting needs mutool"))
+        #t)]
     [(equal? name "r") (lambda () (when doc (queue-open (hash-ref doc "path") #t)) #t)]
     [(equal? name "t") open-contents]
     [(equal? name "o")
@@ -823,7 +879,7 @@ pix.asPNG().save(a[0]);
   (cond
     [(equal? result "submit")
       (set! searching #f)
-      (start-search (yinz-ui-text-input-op search-input "DrainText"))]
+      (start-search (yinz-ui-text-input-op search-input "DrainText") #f)]
     [(equal? result "cancel") (set! searching #f)])
   #t)
 
@@ -875,7 +931,7 @@ pix.asPNG().save(a[0]);
              [hit (current-hit)])
         (string-append
           ESC "[1m" (hash-ref doc "title") ESC "[22m  " printed (num->string page) "/" (num->string (hash-ref doc "pages")) "  " mode
-          (if invert "  inverted" "")
+          (if (inverted?) "  inverted" "")
           (if (equal? digits "") "" (string-append "  go to: " digits))
           (cond
             [(and search hit)
@@ -906,10 +962,13 @@ pix.asPNG().save(a[0]);
   (define top (quotient area 2))
   (string-append (newlines top) (yinz-ui-center message cols) (newlines (- area top))))
 
+;; A neighbour that fails is only logged; it shows its problem if you go there.
 (define (prefetch current area cols)
   (for-each (lambda (n)
               (when (and (>= n 1) (<= n (hash-ref current "pages")))
-                (background (rasterize current n (layout current n area cols)))))
+                (let ([box (layout current n area cols)])
+                  (yinz-catch (rasterize current n box (page-highlight current n box))
+                    (lambda (reason) (yinz-log (string-append "could not prefetch page " (num->string n) ": " (message-of reason))))))))
     (list (+ page 1) (- page 1))))
 
 ;; Start locating the current page's matches when it has some.
@@ -919,31 +978,37 @@ pix.asPNG().save(a[0]);
     (background (load-boxes current (hash-ref search "id") page))))
 
 ;; A raster of the current page to show while its highlights are drawn.
-(define (stand-in box)
-  (define sent (get shown (client-id) #f))
-  (define same-box (and sent (starts-with? (hash-ref sent "key") (box-prefix page box))))
-  (define plain (raster-key page box #f))
+(define (stand-in current client box)
+  (define sent (get shown client #f))
+  (define same-box (and sent (starts-with? (hash-ref sent "key") (box-prefix current page box))))
+  (define plain (raster-key current page box #f))
   (cond
     [(hash-contains? cache plain) (hash-ref cache plain)]
     [(and sent same-box (hash-contains? cache (hash-ref sent "key"))) (hash-ref cache (hash-ref sent "key"))]
     [else #f]))
 
-(define (draw-page current rows cols)
+(define (draw-page current client rows cols)
   (define area (max 1 (- rows 1)))
   (define box (layout current page area cols))
   (set! scroll (if (equal? fit "width") (min scroll (max 0 (- (box-h box) area))) 0))
   (locate-matches current)
-  (let* ([key (raster-key page box (highlight page))]
-         [ready (get cache key #f)])
+  (let* ([hl (page-highlight current page box)]
+         [key (raster-key current page box hl)]
+         [ready (get cache key #f)]
+         [problem (get broken key #f)])
     (cond
       [ready (prefetch current area cols)]
+      [problem (prefetch current area cols)]
       [(not (equal? requested key))
         (set! requested key)
-        (background (yinz-then (rasterize current page box) (lambda (_) (yinz-request-render))))])
-    (let ([raster (or ready (stand-in box))])
-      (if (not raster) (placeholder (string-append "rendering page " (num->string page) "…") area cols)
-        (let* ([client (client-id)]
-               [sent (get shown client #f)]
+        (background (yinz-then (rasterize current page box hl) (lambda (_) (yinz-request-render))))])
+    (let ([raster (or ready (stand-in current client box))])
+      (if (not raster)
+        (placeholder (if problem
+                       (yinz-ui-truncate (text-sanitize (string-append "could not render page " (num->string page) ": " problem)) cols)
+                       (string-append "rendering page " (num->string page) "…"))
+          area cols)
+        (let* ([sent (get shown client #f)]
                [head ""])
           (unless (and sent (equal? (hash-ref sent "key") (hash-ref raster "key")))
             (when sent (set! head (string-append ESC "_Ga=d,d=I,i=" (num->string (hash-ref sent "id")) ",q=2" ESC "\\")))
@@ -1005,10 +1070,12 @@ pix.asPNG().save(a[0]);
                             (yinz-data-attr "invert" 'bool))))
       (detect-tools))))
 
+;; A report of zero or other unusable sizes counts as unknown.
 (define (use-cell-geometry geometry)
-  (define (known? key override) (or override (and (hash? geometry) (hash-contains? geometry key))))
-  (set! cell-width-px (or cell-width-override (get geometry "width" 12)))
-  (set! cell-height-px (or cell-height-override (get geometry "height" 22)))
+  (define (measured key) (let ([v (get geometry key #f)]) (and (number? v) (> v 0) v)))
+  (define (known? key override) (or override (measured key)))
+  (set! cell-width-px (or cell-width-override (measured "width") 12))
+  (set! cell-height-px (or cell-height-override (measured "height") 22))
   (set! density (or density-override
                     (if (and (known? "width" cell-width-override) (known? "height" cell-height-override)) 1 2))))
 
@@ -1016,11 +1083,12 @@ pix.asPNG().save(a[0]);
   (set! cell-width-override (config-number configuration "cell_width" #f))
   (set! cell-height-override (config-number configuration "cell_height" #f))
   (set! density-override (config-number configuration "density" #f))
-  (set! cell-geometries (hash (client-id) (yinz-cell-pixel-size)))
-  (use-cell-geometry (hash-ref cell-geometries (client-id)))
+  (define ids (yinz-command "GetPluginIds"))
+  (set! cell-geometries (hash (hash-ref ids "client_id") (yinz-cell-pixel-size)))
+  (use-cell-geometry (hash-ref cell-geometries (hash-ref ids "client_id")))
   (set! fit (if (equal? (get configuration "fit" "page") "width") "width" "page"))
   (set! invert (equal? (get configuration "invert" "false") "true"))
-  (set! initial-cwd (hash-ref (yinz-command "GetPluginIds") "initial_cwd"))
+  (set! initial-cwd (hash-ref ids "initial_cwd"))
   (set! initialization (initialize))
   (background initialization)
   (yinz-command (hash "Subscribe" '("Key" "Mouse" "CellPixelSizeChanged")))
@@ -1028,6 +1096,7 @@ pix.asPNG().save(a[0]);
     (unless (equal? file "") (queue-open file #f))))
 
 (define (unload)
+  (remember)
   (if (equal? scratch "") #f (run (list "rm" "-rf" scratch))))
 
 (define (update event)
@@ -1035,12 +1104,10 @@ pix.asPNG().save(a[0]);
     [(not (hash? event)) #f]
     [(hash-contains? event "CellPixelSizeChanged")
       (define geometry (hash-ref event "CellPixelSizeChanged"))
-      (define changed (not (equal? geometry (get cell-geometries (client-id) #f))))
-      (set! cell-geometries (hash-insert cell-geometries (client-id) geometry))
-      (when changed
-        (set! cache (hash))
-        (set! cache-order '())
-        (set! requested ""))
+      (define client (client-id))
+      (define changed (not (equal? geometry (get cell-geometries client #f))))
+      (set! cell-geometries (hash-insert cell-geometries client geometry))
+      (when changed (forget-rasters))
       changed]
     [(hash-contains? event "Key")
       (let ([key (hash-ref event "Key")])
@@ -1076,7 +1143,7 @@ pix.asPNG().save(a[0]);
   (let ([body (cond
                 [(not doc) (newlines (- rows 1))]
                 [contents (draw-contents rows cols)]
-                [else (draw-page doc rows cols)])])
-    ;; Every change of position is followed by a render, so save it here.
-    (remember)
+                [else (draw-page doc client rows cols)])])
+    ;; Every change of position is followed by a render, so save it from here.
+    (schedule-save)
     (string-append body (status-line cols))))

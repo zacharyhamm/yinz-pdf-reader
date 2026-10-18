@@ -254,11 +254,16 @@
   (define catalog (test-session "catalog"))
   (assert (not (null? (filter (lambda (info) (equal? (hash-ref (hash-ref info "def") "name") "position")) catalog)))
     (yinz-json-string catalog))
-  (define rows (position-rows))
-  (define (column name)
+  ;; The position is written shortly after it changes, not during the render.
+  (define (column-of rows name)
     (define columns (hash-ref rows "columns"))
     (define index (list-index (lambda (column) (equal? column name)) columns))
     (list-ref (car (hash-ref rows "rows")) index))
+  (test-wait-for "saved position"
+    (lambda () (define current (position-rows))
+      (and (pair? (hash-ref current "rows")) (equal? (column-of current "page") (hash "Int" 17)))))
+  (define rows (position-rows))
+  (define (column name) (column-of rows name))
   (assert-equal (length (hash-ref rows "rows")) 1)
   (assert-equal (column "page") (hash "Int" 17))
   (assert-equal (column "fit") (hash "Text" "width"))
@@ -470,10 +475,11 @@
   (define home
     (fixture (hash "repo/tracked.pdf" (sample-pdf 2) "repo/deleted.pdf" (sample-pdf 8)
                    "repo/untracked.PDF" (sample-pdf 3) "repo/ignored.pdf" (sample-pdf 9)
+                   "repo/notes \"draft\".pdf" (sample-pdf 4)
                    "repo/.gitignore" "ignored.pdf\n" "repo/nested/keep" ""
                    "alias.kdl" "plugins { file-finder location=\"yinz:file-finder\" { width \"80%\"; height \"70%\"; fzf_args \"--prompt=custom-pdf: --no-sort\"; }; }\n")
              (hash "setup" (string-append "set -eu\ncd \"$HOME/repo\"\ngit init -q\n"
-                             "git add tracked.pdf deleted.pdf .gitignore\n"
+                             "git add tracked.pdf deleted.pdf .gitignore 'notes \"draft\".pdf'\n"
                              "git -c user.name=Test -c user.email=test@example.invalid commit -qm initial\n"
                              "git worktree add -qb linked \"$HOME/linked\"\n"
                              "rm deleted.pdf \"$HOME/linked/deleted.pdf\"\n"
@@ -489,6 +495,8 @@
   (test-wait-for-text (string-append home "/linked/linked.PDF"))
   (assert (string-contains? (screen) (string-append home "/repo/tracked.pdf")))
   (assert (string-contains? (screen) (string-append home "/repo/untracked.PDF")))
+  ;; git quotes this name in its line output.
+  (assert (string-contains? (screen) (string-append home "/repo/notes \"draft\".pdf")))
   (assert (not (string-contains? (screen) "ignored.pdf")))
   (assert (not (string-contains? (screen) "deleted.pdf")))
   (define finder (car (finders)))
