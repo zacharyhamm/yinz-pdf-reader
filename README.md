@@ -50,12 +50,16 @@ tracked or untracked but not ignored. Outside a checkout it lists the PDFs
 under the pane's directory, excluding hidden directories and files. Extensions
 are case-insensitive; deleted and ignored files are excluded in git checkouts.
 The finder supports UTF-8 filenames without newlines. The chosen file opens in
-a floating reader pane. Later picks open in that same reader while it is running. The finder launches
+a tiled reader pane beside your panes. Later picks open in that same reader while it is
+running, and focus it, from any tab. The finder launches
 through your `file-finder` alias, so its geometry and custom `fzf_args` apply.
 The PDF launch overrides only `overlay`, `file_command`, and `openers_json`.
 Configuration merges replace whole values, including the opener map. Persistent
-alias settings stay unchanged. The finder sends the literal path directly to
-the reader; manual `yinz pipe --name open` remains supported.
+alias settings stay unchanged. The finder hands the literal path back to the
+palette plugin, since a reader the finder launches itself would float; the
+palette pipes it on to the reader as a tiled launch with a `focus` argument,
+which a pipe to a running reader otherwise lacks. Manual `yinz pipe --name open`
+remains supported and leaves focus where it is.
 
 Find the action with “pdf reader”, “open document”, “pdf open”, or “read pdf”.
 
@@ -63,9 +67,9 @@ Find the action with “pdf reader”, “open document”, “pdf open”, or �
 in two steps. A first finder lists your home directory and every folder under
 it, excluding hidden ones. Pick a folder and a second finder lists the PDFs
 anywhere beneath it, again without hidden files or directories, and the pick
-opens in the reader. The first finder sends the folder back to the palette
+opens in the reader. Both finders send their pick back to the palette
 plugin, which surfaces it briefly as a floating pane; the plugin hides itself
-again before launching the second finder. Both finders use your `file-finder`
+again before launching the second finder or the reader. Both finders use your `file-finder`
 alias settings.
 Native palette matching and ranking determine the results. Opens wait for
 permissions and tool initialization, then run in arrival order. Individual open
@@ -173,7 +177,7 @@ including line breaks. While a search is active `n` and `N` step through matches
 | `fit` | `page` | initial mode, `page` or `width` |
 | `invert` | `false` | start with inverted colours |
 | `cell_width`, `cell_height` | terminal report, else `12`, `22` | explicit pixel dimensions override the terminal report |
-| `density` | `2` | rasterisation scale relative to the cell size |
+| `density` | `1` with known cell pixels, else `2` | rasterisation scale relative to the cell size, lowered when a page would exceed the host's image limits |
 
 ## Tests
 
@@ -201,13 +205,18 @@ worktrees, permission prompts, cancellation, and reader reuse.
 
 The palette resolves its sibling `main.scm` through the host's confined source
 resolver, including pinned Git repository installs. Set `reader` to a stable
-alias to preserve reader identity across repository updates. Folder picks keep
-using `plugin_id` so they reach the existing palette instance.
+alias to preserve reader identity across repository updates. Folder and PDF picks use
+`plugin_id` so they reach the existing palette instance.
 
 Cell-pixel reports update the raster dimensions and invalidate cached geometry.
 Terminals without reports use the documented fallback, and explicit geometry
-settings take precedence. Density stays at 2; large pages need no lower-resolution
-workaround. Client ids are not reused, so a reattaching client is sent the page
+settings take precedence. Reported or configured cells are the terminal's own
+pixels, so pages draw at density 1, one image pixel per terminal pixel; the
+fallback geometry is a guess and draws at density 2. A configured `density`
+overrides both. Density drops only when the raster would exceed the
+host's image limits (10000 pixels a side, 100 MiB decoded), as a full-screen pane
+with large cells can; that page is drawn at the largest scale that fits and
+still fills its box. Client ids are not reused, so a reattaching client is sent the page
 image again without a grid-reset event.
 
 The large-page regression uses `/usr/bin/python3` to generate a deterministic

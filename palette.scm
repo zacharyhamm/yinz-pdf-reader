@@ -59,9 +59,19 @@
 
 (define (run-action action) (yinz-command (hash "RunAction" (list action (hash)))))
 
-(define (to-reader target) (hash "pdf" (hash "plugin" target "message" "open")))
+;; Picks come back to this instance as `open`: a reader the finder launched
+;; itself would float.
+(define (to-palette) (hash "pdf" (hash "plugin_id" plugin-id "message" "open")))
 
-(define (finder-launch target) (launch LIST (to-reader target)))
+;; Pipe the pick to the reader, launching it as a tiled pane when it is not
+;; running. `focus` asks it to focus itself, as a pipe to a running plugin does not.
+(define (to-reader target path)
+  (hash "KeybindPipe"
+    (hash "name" "open" "payload" path "args" (hash "focus" "true") "plugin" target "configuration" json-null
+          "launch_new" #f "skip_cache" #f "floating" #f "in_place" #f "cwd" json-null "pane_title" json-null
+          "plugin_id" json-null)))
+
+(define (finder-launch) (launch LIST (to-palette)))
 
 ;; The first step: a finder over folders, whose pick comes back to this
 ;; instance as `folder`. A folder named like a PDF would otherwise go to the reader.
@@ -74,7 +84,7 @@
         "aliases" '("pdf reader" "open document" "pdf open" "read pdf")
         "description" "Find a PDF in this project or its worktrees"
         "run" (lambda (values context)
-                (run-action (finder-launch reader)) (void))))
+                (run-action (finder-launch)) (void))))
 
 (define OPEN-FROM-FOLDER
   (hash "id" "open-from-folder" "label" "Open PDF from folder…"
@@ -91,10 +101,11 @@
       (yinz-palette-register "pdf-reader" "PDF reader" (list OPEN-PDF OPEN-FROM-FOLDER)))))
 
 (define (pipe message)
+  (define name (hash-ref message "name"))
   (define payload (if (hash-contains? message "payload") (hash-ref message "payload") json-null))
-  (when (and (equal? (hash-ref message "name") "folder") (string? payload) (not (equal? payload "")))
-    ;; Delivering the folder pick surfaces this background plugin as a
-    ;; floating pane; put it back out of sight.
+  (when (and (member name '("folder" "open")) (string? payload) (not (equal? payload "")))
+    ;; Delivering a pick surfaces this background plugin as a floating pane;
+    ;; put it back out of sight.
     (yinz-command "HideSelf")
-    (run-action (launch (folder-list payload) (to-reader reader))))
+    (run-action (if (equal? name "folder") (launch (folder-list payload) (to-palette)) (to-reader reader payload))))
   #f)

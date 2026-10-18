@@ -27,12 +27,15 @@
 (define ESC "\x1b;")
 
 ;; Reports set the raster scale; explicit configuration wins, with a fallback
-;; for terminals that do not report cell pixels. Density remains two.
+;; for terminals that do not report cell pixels. Known cells are the terminal's
+;; own pixels, so pages draw at density one; the fallback is a guess, which
+;; density two covers. A configured density wins over both.
 (define cell-width-px 12)
 (define cell-height-px 22)
 (define cell-width-override #f)
 (define cell-height-override #f)
 (define cell-geometries (hash))
+(define density-override #f)
 (define density 2)
 
 ;; The open document: "path", "title", "pages", and "sizes", a vector of page
@@ -548,13 +551,29 @@ pix.asPNG().save(a[0]);
 
 (define (box-prefix n box)
   (string-append (num->string n) ":" (num->string (box-w box)) "x" (num->string (box-h box)) ":"
-    (num->string cell-width-px) "x" (num->string cell-height-px) ":" (if invert "i" "")))
+    (num->string cell-width-px) "x" (num->string cell-height-px) "@" (num->string density) ":" (if invert "i" "")))
 (define (raster-key n box hl)
   (string-append (box-prefix n box) (if hl (string-append ":" (hash-ref hl "key")) "")))
 
+;; The host decodes images to RGBA and refuses any side over 10000 pixels or any
+;; image over 100 MiB, so a box too big for that at `density` (a full-screen
+;; pane with large cells) is drawn at the largest scale that fits; the
+;; placement still fills the box. The 2% margin covers pdftoppm deriving the
+;; height from the page rather than the box.
+(define MAX-RASTER-SIDE 9800)
+(define MAX-RASTER-PIXELS (* 0.98 (/ 104857600 4)))
+
+;; The raster size in pixels for `box`: (w . h).
+(define (raster-pixels box cell-width cell-height)
+  (let* ([w (* (box-w box) cell-width density)]
+         [h (* (box-h box) cell-height density)]
+         [s (min (min 1 (/ MAX-RASTER-SIDE (max w h))) (sqrt (/ MAX-RASTER-PIXELS (* w h))))])
+    (cons (max 1 (js-floor (* w s))) (max 1 (js-floor (* h s))))))
+
 (define (raster-command path n box hl cell-width cell-height)
-  (define px-w (num->string (* (box-w box) cell-width density)))
-  (define px-h (num->string (* (box-h box) cell-height density)))
+  (define pixels (raster-pixels box cell-width cell-height))
+  (define px-w (num->string (car pixels)))
+  (define px-h (num->string (cdr pixels)))
   (cond
     [hl (mutool-run "highlight.js" (list path (num->string n) px-w px-h (if invert "1" "0") (hash-ref hl "marks")) #t)]
     [(equal? renderer "mutool")
@@ -987,15 +1006,18 @@ pix.asPNG().save(a[0]);
       (detect-tools))))
 
 (define (use-cell-geometry geometry)
+  (define (known? key override) (or override (and (hash? geometry) (hash-contains? geometry key))))
   (set! cell-width-px (or cell-width-override (get geometry "width" 12)))
-  (set! cell-height-px (or cell-height-override (get geometry "height" 22))))
+  (set! cell-height-px (or cell-height-override (get geometry "height" 22)))
+  (set! density (or density-override
+                    (if (and (known? "width" cell-width-override) (known? "height" cell-height-override)) 1 2))))
 
 (define (load configuration)
   (set! cell-width-override (config-number configuration "cell_width" #f))
   (set! cell-height-override (config-number configuration "cell_height" #f))
+  (set! density-override (config-number configuration "density" #f))
   (set! cell-geometries (hash (client-id) (yinz-cell-pixel-size)))
   (use-cell-geometry (hash-ref cell-geometries (client-id)))
-  (set! density (config-number configuration "density" density))
   (set! fit (if (equal? (get configuration "fit" "page") "width") "width" "page"))
   (set! invert (equal? (get configuration "invert" "false") "true"))
   (set! initial-cwd (hash-ref (yinz-command "GetPluginIds") "initial_cwd"))
@@ -1035,10 +1057,14 @@ pix.asPNG().save(a[0]);
           [else #f]))]
     [else #f]))
 
+;; The palette asks for `focus`: its pipe does not focus a running reader.
 (define (pipe message)
   (define payload (get message "payload" json-null))
   (if (or (not (equal? (get message "name" "") "open")) (json-null? payload) (equal? payload "")) #f
-    (begin (queue-open payload #f) #t)))
+    (begin
+      (when (equal? (get (get message "args" (hash)) "focus" "") "true") (yinz-command (hash "ShowSelf" #f)))
+      (queue-open payload #f)
+      #t)))
 
 (define (render rows cols)
   (define client (client-id))
