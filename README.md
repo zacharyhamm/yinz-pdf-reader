@@ -1,6 +1,6 @@
 # yinz-pdf-reader
 
-A [yinz](https://github.com/zacharyhamm/yinz) TypeScript plugin that renders PDF
+A [yinz](https://github.com/zacharyhamm/yinz) Steel Scheme plugin that renders PDF
 pages inside a pane with the kitty graphics protocol. Pages are drawn through
 unicode placeholders, so the image lives in the pane's cell grid and clips,
 scrolls, moves and resizes with the pane.
@@ -10,6 +10,12 @@ plus `mutool` (MuPDF) or `pdftoppm` (Poppler) on the host. Search uses
 `pdftotext` (Poppler, alongside `pdfinfo`); highlighting matches on the page
 needs `mutool`, as do the table of contents and printed page labels.
 
+Requires yinz `main` at **d9e8dbf7e3827ff22988e816219930fd610847d9** or newer. The version
+string `0.1.0` alone does not identify this SDK: it must provide
+`yinz-plugin-resolve`, `yinz-cell-pixel-size`, Unicode regex support, and the
+8 MiB `yinz-ui-image-max-bytes` limit, and must no longer reuse client ids (that
+build removed the `ClientGridReset` event). Earlier Steel builds are unsupported.
+
 The plugin asks for `RunCommands`, to run those tools, and `PluginData`, to
 remember where each document was left.
 
@@ -18,8 +24,8 @@ remember where each document was left.
 ```sh
 yinz plugin --floating \
   --configuration-json '{"file":"/books/Pachev, Sasha #?%2C 雪.pdf"}' \
-  -- 'file:///path/to/yinz-pdf-reader/main.ts'
-yinz pipe --plugin 'file:///path/to/yinz-pdf-reader/main.ts' --name open -- /path/to/doc.pdf
+  -- 'file:///path/to/yinz-pdf-reader/main.scm'
+yinz pipe --plugin 'file:///path/to/yinz-pdf-reader/main.scm' --name open -- /path/to/doc.pdf
 ```
 
 Or press `o` in the pane and type a path. Relative paths resolve against the
@@ -37,7 +43,7 @@ need no migration because their keys already use resolved document paths.
 
 ## From the command palette
 
-`palette.ts` adds **Open PDF…** to the command palette (`Ctrl Alt p`). It opens
+`palette.scm` adds **Open PDF…** to the command palette (`Ctrl Alt p`). It opens
 the builtin file finder (fzf, so `fzf` must be on `PATH`) listing every PDF in
 the focused pane's git project: the main checkout and each of its worktrees,
 tracked or untracked but not ignored. Outside a checkout it lists the PDFs
@@ -52,6 +58,15 @@ alias settings stay unchanged. The finder sends the literal path directly to
 the reader; manual `yinz pipe --name open` remains supported.
 
 Find the action with “pdf reader”, “open document”, “pdf open”, or “read pdf”.
+
+**Open PDF from folder…** (“pdf folder”, “pdf directory”, “browse pdfs”) works
+in two steps. A first finder lists your home directory and every folder under
+it, excluding hidden ones. Pick a folder and a second finder lists the PDFs
+anywhere beneath it, again without hidden files or directories, and the pick
+opens in the reader. The first finder sends the folder back to the palette
+plugin, which surfaces it briefly as a floating pane; the plugin hides itself
+again before launching the second finder. Both finders use your `file-finder`
+alias settings.
 Native palette matching and ranking determine the results. Opens wait for
 permissions and tool initialization, then run in arrival order. Individual open
 failures do not stop later selections. Initialization failure or permission
@@ -62,7 +77,7 @@ Load it in the background in your yinz configuration:
 
 ```kdl
 load_plugins {
-    "file:///path/to/yinz-pdf-reader/palette.ts" {
+    "file:///path/to/yinz-pdf-reader/palette.scm" {
         shared true
     }
 }
@@ -78,7 +93,7 @@ reader's alias, so permissions and saved positions follow it across updates:
 ```kdl
 plugins {
     pdf-reader repo="https://github.com/zacharyhamm/yinz-pdf-reader.git" branch="main"
-    pdf-palette repo="https://github.com/zacharyhamm/yinz-pdf-reader.git" branch="main" entrypoint="palette.ts" {
+    pdf-palette repo="https://github.com/zacharyhamm/yinz-pdf-reader.git" branch="main" entrypoint="palette.scm" {
         shared true
         reader "pdf-reader"
     }
@@ -143,10 +158,12 @@ first match on or after the current page and shows `match 3/61 · page 22` in
 the status line. Matches are highlighted on the page, the current one in
 orange, and in fit-width mode the view scrolls to keep it on screen.
 
-Case is ignored unless the query contains an uppercase letter, and spaces in
-the query match any run of whitespace, including line breaks. While a search
-is active `n` and `N` step through matches (wrapping at either end) and
-`Space`, `PgDn`, `p`, the arrows and so on still page.
+Search ignores case using Unicode simple folding unless the query contains a
+letter in Unicode category `Lu` (uppercase letters). Titlecase letters such as
+`ǅ` keep matching case-insensitively. Simple folding matches `s` with `ſ`, but
+does not expand `ß` to `ss`. Spaces in the query match any run of whitespace,
+including line breaks. While a search is active `n` and `N` step through matches
+(wrapping at either end) and `Space`, `PgDn`, `p`, the arrows and so on still page.
 
 ## Configuration
 
@@ -155,23 +172,52 @@ is active `n` and `N` step through matches (wrapping at either end) and
 | `file` | – | document to open on load |
 | `fit` | `page` | initial mode, `page` or `width` |
 | `invert` | `false` | start with inverted colours |
-| `cell_width`, `cell_height` | `12`, `22` | assumed cell size in pixels, used to shape the page box |
-| `density` | `2` | rasterisation scale relative to the assumed cell size |
+| `cell_width`, `cell_height` | terminal report, else `12`, `22` | explicit pixel dimensions override the terminal report |
+| `density` | `2` | rasterisation scale relative to the cell size |
 
 ## Tests
 
 ```sh
-/home/zacharyhamm/.local/bin/yinz plugins check --file main.ts --json
-/home/zacharyhamm/.local/bin/yinz plugins check --file palette.ts --json
-/home/zacharyhamm/.local/bin/yinz plugins test --file main.ts --kind all --timeout-ms 60000 --json
-/home/zacharyhamm/.local/bin/yinz plugins test --file palette.ts --kind all --timeout-ms 60000 --json
+yinz plugins check ./main.scm --json
+yinz plugins check ./palette.scm --json
+yinz plugins test --file ./lib/text.scm --json
+yinz plugins test --file ./main.scm --kind all --timeout-ms 120000 --json
+yinz plugins test --file ./palette.scm --kind unit --json
 ```
 
-Use the current installed binary: an older `yinz` on `PATH` can report the same
-version while lacking the palette and testing APIs used here.
+Use the SDK build identified above. Put that binary first on `PATH`, so fixture
+CLI commands use the same build as the test runner.
 
-Unit tests cover static palette handles, structured opener configuration,
-permission/tool readiness, FIFO opening, and failure recovery. Integration tests
-use real disposable sessions, PDF tools, palette input, and fzf. They cover
-paging, search, outlines, saved positions, literal filenames, escaped plugin
-URLs, git worktrees, permission prompts, cancellation, and reader reuse.
+`lib/text.test.scm` covers PDF fields and geometry, `pdftotext -bbox` words,
+and the Unicode smart-case matcher. Unit tests cover static palette handles,
+structured opener configuration, confined sibling reader resolution, cell-pixel
+reports and overrides, permission/tool readiness, FIFO opening, saved positions
+and failure recovery. Integration tests use real
+disposable sessions, PDF tools, palette input, and fzf. They cover paging,
+search, outlines, saved positions, literal filenames, escaped plugin URLs, git
+worktrees, permission prompts, cancellation, and reader reuse.
+
+## Steel notes
+
+The palette resolves its sibling `main.scm` through the host's confined source
+resolver, including pinned Git repository installs. Set `reader` to a stable
+alias to preserve reader identity across repository updates. Folder picks keep
+using `plugin_id` so they reach the existing palette instance.
+
+Cell-pixel reports update the raster dimensions and invalidate cached geometry.
+Terminals without reports use the documented fallback, and explicit geometry
+settings take precedence. Density stays at 2; large pages need no lower-resolution
+workaround. Client ids are not reused, so a reattaching client is sent the page
+image again without a grid-reset event.
+
+The large-page regression uses `/usr/bin/python3` to generate a deterministic
+noise PDF, and real MuPDF to verify its PNG exceeds 2 MiB at density 2. It checks
+repeated navigation and a later `open` message against the same reader instance.
+
+Integration fixtures use `test-resolve` and `test-copy-plugin`; only Scheme source
+dependencies are copied. Runtime assets must be explicit fixtures. Fixture CLI
+commands use the harness socket environment. Put the tested Yinz binary first on
+`PATH` when running the suites.
+
+Saved positions belong to the reader's identity, so positions saved by the old
+`main.ts` reader are not seen by `main.scm`.
